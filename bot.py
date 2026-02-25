@@ -12,8 +12,8 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
-# Define what constitutes a "Win" or a "Hit" (e.g., 2.0 means 2x multiplier)
 WIN_MULTIPLIER = 2.0 
+MIN_CALLS_REQUIRED = 1 # Changed to 1! Everyone gets ranked immediately.
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables!")
@@ -26,7 +26,6 @@ settings_collection = db['group_settings']
 CA_REGEX = r'\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b'
 
 def get_dexscreener_batch(cas_list):
-    """Fetches up to 30 tokens at once from DexScreener to save API requests."""
     results = {}
     for i in range(0, len(cas_list), 30):
         chunk = cas_list[i:i+30]
@@ -95,7 +94,8 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode='Markdown'
                 )
 
-async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
+    """Helper function to calculate rankings for both /leaderboard and /bottom"""
     chat_id = update.message.chat_id
     query = {"chat_id": chat_id}
     time_text = "All Time"
@@ -116,7 +116,8 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
-    status_message = await update.message.reply_text(f"🔄 Fetching {time_text} leaderboard...")
+    list_type = "Wall of Shame" if is_bottom else "Leaderboard"
+    status_message = await update.message.reply_text(f"🔄 Fetching {time_text} {list_type}...")
     
     all_calls = list(calls_collection.find(query))
     if not all_calls:
@@ -148,23 +149,40 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     leaderboard_data = []
     for user, data in user_stats.items():
         total_calls = len(data['mults'])
-        leaderboard_data.append({
-            'name': user, 
-            'avg': sum(data['mults']) / total_calls, 
-            'best': max(data['mults']), 
-            'total_calls': total_calls,
-            'hit_rate': (data['wins'] / total_calls) * 100
-        })
+        
+        if total_calls >= MIN_CALLS_REQUIRED:
+            leaderboard_data.append({
+                'name': user, 
+                'avg': sum(data['mults']) / total_calls, 
+                'best': max(data['mults']), 
+                'total_calls': total_calls,
+                'hit_rate': (data['wins'] / total_calls) * 100
+            })
 
-    leaderboard_data.sort(key=lambda x: x['avg'], reverse=True)
+    if not leaderboard_data:
+        await status_message.edit_text(f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked yet!")
+        return
+
+    leaderboard_data.sort(key=lambda x: x['avg'], reverse=not is_bottom)
+    
+    if is_bottom:
+        context.chat_data['leaderboard_title'] = f"📉 **Wall of Shame ({time_text})** 📉"
+    else:
+        context.chat_data['leaderboard_title'] = f"🏆 **Yabai Callers ({time_text})** 🏆"
+        
     context.chat_data['leaderboard_data'] = leaderboard_data
-    context.chat_data['leaderboard_time_text'] = time_text
     
     await render_leaderboard_page(status_message, context, page=0)
 
+async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _fetch_and_calculate_rankings(update, context, is_bottom=False)
+
+async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _fetch_and_calculate_rankings(update, context, is_bottom=True)
+
 async def render_leaderboard_page(message_obj, context, page=0):
     data = context.chat_data.get('leaderboard_data', [])
-    time_text = context.chat_data.get('leaderboard_time_text', "All Time")
+    title = context.chat_data.get('leaderboard_title', "Leaderboard")
     
     items_per_page = 10
     total_pages = math.ceil(len(data) / items_per_page)
@@ -173,12 +191,12 @@ async def render_leaderboard_page(message_obj, context, page=0):
     end_idx = start_idx + items_per_page
     page_data = data[start_idx:end_idx]
 
-    text = f"🏆 **Yabai Callers ({time_text})** 🏆\n*Page {page + 1} of {total_pages}*\n\n"
+    text = f"{title}\n*(Min. {MIN_CALLS_REQUIRED} calls to rank)*\n*Page {page + 1} of {total_pages}*\n\n"
     
     for idx, user in enumerate(page_data, start=start_idx + 1):
         text += (f"{idx}. **{user['name']}** ({user['total_calls']} calls)\n"
                  f"   📈 Avg: {user['avg']:.2f}x | 🔥 Best: {user['best']:.2f}x\n"
-                 f"   🎯 Win Rate: {user['hit_rate']:.1f}% (>= {WIN_MULTIPLIER}x)\n\n")
+                 f"   🎯 Win Rate: {user['hit_rate']:.1f}%\n\n")
 
     buttons = []
     if page > 0:
@@ -200,7 +218,7 @@ async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYP
     if 'leaderboard_data' in context.chat_data:
         await render_leaderboard_page(query.message, context, page)
     else:
-        await query.message.edit_text("Leaderboard data expired. Please run /leaderboard again.")
+        await query.message.edit_text("Data expired. Please run the command again.")
 
 async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -224,12 +242,10 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"I couldn't find any calls for '{target}' in this group.")
         return
 
-    # Calculate overall win rate for this user
     total_calls = len(all_user_calls)
     wins = sum(1 for c in all_user_calls if (max(c['ath_mcap'], c.get('current_mcap', 0)) / c['initial_mcap']) >= WIN_MULTIPLIER)
     hit_rate = (wins / total_calls) * 100
 
-    # Get latest prices for top 5 recent plays to update DB
     recent_calls = all_user_calls[:5]
     ca_list = [c['ca'] for c in recent_calls]
     batch_data = get_dexscreener_batch(ca_list)
@@ -259,7 +275,6 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode='Markdown')
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates an overview of the entire group's performance."""
     chat_id = update.message.chat_id
     status_message = await update.message.reply_text("🔄 Analyzing group performance...")
 
@@ -268,7 +283,6 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await status_message.edit_text("No calls tracked in this group yet!")
         return
 
-    # Calculate Group Stats
     total_calls = len(all_calls)
     unique_callers = set()
     total_wins = 0
@@ -279,8 +293,6 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     for call in all_calls:
         unique_callers.add(call['caller_name'])
-        
-        # Calculate max multiplier for this call
         mult = max(call['ath_mcap'], call['current_mcap']) / call['initial_mcap']
         total_mults.append(mult)
         
@@ -346,14 +358,15 @@ def main():
     
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_ca))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("bottom", bottom))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("togglealerts", toggle_alerts))
     app.add_handler(CommandHandler("caller", caller_profile)) 
-    app.add_handler(CommandHandler("groupstats", group_stats)) # New Command!
+    app.add_handler(CommandHandler("groupstats", group_stats)) 
     
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern='^lb_'))
     
-    print("YabaiRankBot is running successfully with performance tracking!")
+    print("YabaiRankBot is running with /bottom and min call limits disabled (set to 1)!")
     app.run_polling()
 
 if __name__ == "__main__":
