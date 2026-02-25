@@ -1,48 +1,45 @@
+import os
 import re
 import requests
 from pymongo import MongoClient
 from telegram import Update
 from telegram.ext import Application, MessageHandler, CommandHandler, filters, ContextTypes
 
-# --- CONFIGURATION ---
-TOKEN = "8668201692:AAH_dbN4O0hpryj8MWq0a-LA3712eD-z5QE"
-MONGO_URI = "mongodb+srv://ReklessDean:Incripted11!@cluster0.zytbbgk.mongodb.net/?appName=Cluster0"
+# --- CONFIGURATION (Now securely using Environment Variables!) ---
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+MONGO_URI = os.getenv("MONGO_URI")
 
-# Connect to MongoDB
+# Safety check to ensure variables are loaded
+if not TOKEN or not MONGO_URI:
+    raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables!")
+
 client = MongoClient(MONGO_URI)
 db = client['yabai_crypto_bot']
 calls_collection = db['token_calls']
 
-# Regex to detect EVM (0x...) and Solana/Pump.fun CAs (Base58, 32-44 chars)
 CA_REGEX = r'\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b'
 
 def get_dexscreener_data(ca):
-    """Fetches token data from DexScreener API."""
     try:
         url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
         response = requests.get(url).json()
         if response.get('pairs'):
-            # Return the FDV (Market Cap) of the most liquid pair
             return response['pairs'][0].get('fdv', 0)
     except Exception as e:
         print(f"Error fetching DexScreener data: {e}")
     return None
 
 async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Listens to group messages, detects CAs, and saves the initial call."""
     message = update.message.text
     user = update.message.from_user
     
-    # Find all CAs in the message
     found_cas = set(re.findall(CA_REGEX, message))
     
     for ca in found_cas:
-        # Check if this CA was already called by someone else
         existing_call = calls_collection.find_one({"ca": ca})
         if existing_call:
-            continue # Already tracked, skip to give original caller credit
+            continue 
         
-        # Fetch current MCAP
         mcap = get_dexscreener_data(ca)
         if mcap and mcap > 0:
             call_data = {
@@ -58,15 +55,13 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🎯 **New Call Tracked!**\n\n"
                 f"🪙 CA: `{ca}`\n"
                 f"👤 Caller: {user.first_name}\n"
-                f"💰 Called at MCAP: ${mcap:,.2f}",
+                f"💰 Called at: ${mcap:,.2f}",
                 parse_mode='Markdown'
             )
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Updates active CAs and displays the leaderboard."""
-    await update.message.reply_text("🔄 Updating latest prices from DexScreener. Please wait...")
+    await update.message.reply_text("🔄 Updating latest prices...")
     
-    # Update all tracked tokens to find ATH and current multipliers
     all_calls = calls_collection.find()
     user_scores = {}
 
@@ -75,43 +70,71 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_mcap = get_dexscreener_data(ca)
         
         if current_mcap:
-            # Update ATH if the current is higher
             ath = max(call['ath_mcap'], current_mcap)
-            
             calls_collection.update_one(
                 {"_id": call['_id']},
                 {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}}
             )
             
-            # Calculate the X multiplier (ATH / Initial)
             multiplier = ath / call['initial_mcap']
             caller = call['caller_name']
             
-            # Record the highest multiplier per user
             if caller not in user_scores or multiplier > user_scores[caller]:
                 user_scores[caller] = multiplier
 
-    # Sort users by best multipliers
     sorted_users = sorted(user_scores.items(), key=lambda x: x[1], reverse=True)
     
     if not sorted_users:
         await update.message.reply_text("No data yet! Post some CAs.")
         return
 
-    # Build the Leaderboard message
     text = "🏆 **Yabai Callers Leaderboard** 🏆\n\n"
     for rank, (name, best_x) in enumerate(sorted_users, 1):
         text += f"{rank}. {name} - Best Call: **{best_x:.2f}x**\n"
         
     await update.message.reply_text(text, parse_mode='Markdown')
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Please provide a CA. Example: `/stats <CA>`", parse_mode='Markdown')
+        return
+
+    ca = context.args[0]
+    call = calls_collection.find_one({"ca": ca})
+
+    if not call:
+        await update.message.reply_text("I don't have that CA tracked in my database yet!")
+        return
+
+    current_mcap = get_dexscreener_data(ca)
+    
+    if current_mcap:
+        ath = max(call['ath_mcap'], current_mcap)
+        calls_collection.update_one(
+            {"_id": call['_id']},
+            {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}}
+        )
+        
+        current_x = current_mcap / call['initial_mcap']
+        ath_x = ath / call['initial_mcap']
+
+        text = (
+            f"📊 **Stats for Token**\n`{ca}`\n\n"
+            f"👤 Called by: {call['caller_name']}\n"
+            f"🟢 Called at: ${call['initial_mcap']:,.2f}\n"
+            f"🔥 ATH: ${ath:,.2f} (**{ath_x:.2f}x**)\n"
+            f"💰 Current: ${current_mcap:,.2f} (**{current_x:.2f}x**)"
+        )
+        await update.message.reply_text(text, parse_mode='Markdown')
+    else:
+        await update.message.reply_text("Failed to fetch current data from DexScreener.")
+
 def main():
     app = Application.builder().token(TOKEN).build()
     
-    # Listen to all text messages to scrape CAs
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_ca))
-    # Command to show leaderboard
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("stats", stats))
     
     print("YabaiRankBot is running...")
     app.run_polling()
