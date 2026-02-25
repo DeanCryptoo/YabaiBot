@@ -12,6 +12,9 @@ from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQu
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
+# Define what constitutes a "Win" or a "Hit" (e.g., 2.0 means 2x multiplier)
+WIN_MULTIPLIER = 2.0 
+
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables!")
 
@@ -43,7 +46,6 @@ def get_dexscreener_batch(cas_list):
     return results
 
 async def toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Turns the 'New Call Tracked' notification on or off per group."""
     chat_id = update.message.chat_id
     setting = settings_collection.find_one({"chat_id": chat_id})
     
@@ -55,7 +57,6 @@ async def toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔔 **Alerts ON**: I will announce every new tracked CA here.", parse_mode='Markdown')
 
 async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Listens to group messages, detects CAs, and saves the initial call with Chat ID and Timestamp."""
     message = update.message.text
     user = update.message.from_user
     chat_id = update.message.chat_id
@@ -63,7 +64,6 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_cas = set(re.findall(CA_REGEX, message))
     
     for ca in found_cas:
-        # ISOLATION: Check if this CA was already called IN THIS SPECIFIC CHAT
         existing_call = calls_collection.find_one({"ca": ca, "chat_id": chat_id})
         if existing_call:
             continue 
@@ -74,14 +74,14 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if mcap and mcap > 0:
             call_data = {
                 "ca": ca,
-                "chat_id": chat_id, # Isolates data per group
+                "chat_id": chat_id,
                 "caller_id": user.id,
                 "caller_name": user.first_name or "Unknown",
-                "caller_username": user.username, # Saved for easier searching
+                "caller_username": user.username,
                 "initial_mcap": mcap,
                 "ath_mcap": mcap,
                 "current_mcap": mcap,
-                "timestamp": datetime.now(timezone.utc) # Saves exact time of call
+                "timestamp": datetime.now(timezone.utc)
             }
             calls_collection.insert_one(call_data)
             
@@ -96,12 +96,10 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Generates the leaderboard, isolated by group and filtered by time if requested."""
     chat_id = update.message.chat_id
-    query = {"chat_id": chat_id} # ISOLATION: Only fetch this group's calls
+    query = {"chat_id": chat_id}
     time_text = "All Time"
 
-    # TIMEFRAME PARSING: Handle things like /leaderboard 10d or /leaderboard 24h
     if context.args:
         time_arg = context.args[0].lower()
         try:
@@ -116,7 +114,7 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query["timestamp"] = {"$gte": cutoff}
                 time_text = f"Last {hours} Hours"
         except ValueError:
-            pass # If they type something invalid, default to all-time
+            pass
 
     status_message = await update.message.reply_text(f"🔄 Fetching {time_text} leaderboard...")
     
@@ -141,16 +139,21 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caller = call['caller_name']
         
         if caller not in user_stats:
-            user_stats[caller] = []
-        user_stats[caller].append(multiplier)
+            user_stats[caller] = {'mults': [], 'wins': 0}
+        
+        user_stats[caller]['mults'].append(multiplier)
+        if multiplier >= WIN_MULTIPLIER:
+            user_stats[caller]['wins'] += 1
 
     leaderboard_data = []
-    for user, mults in user_stats.items():
+    for user, data in user_stats.items():
+        total_calls = len(data['mults'])
         leaderboard_data.append({
             'name': user, 
-            'avg': sum(mults) / len(mults), 
-            'best': max(mults), 
-            'total_calls': len(mults)
+            'avg': sum(data['mults']) / total_calls, 
+            'best': max(data['mults']), 
+            'total_calls': total_calls,
+            'hit_rate': (data['wins'] / total_calls) * 100
         })
 
     leaderboard_data.sort(key=lambda x: x['avg'], reverse=True)
@@ -160,7 +163,6 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await render_leaderboard_page(status_message, context, page=0)
 
 async def render_leaderboard_page(message_obj, context, page=0):
-    """Draws the leaderboard page."""
     data = context.chat_data.get('leaderboard_data', [])
     time_text = context.chat_data.get('leaderboard_time_text', "All Time")
     
@@ -175,7 +177,8 @@ async def render_leaderboard_page(message_obj, context, page=0):
     
     for idx, user in enumerate(page_data, start=start_idx + 1):
         text += (f"{idx}. **{user['name']}** ({user['total_calls']} calls)\n"
-                 f"   📈 Avg: {user['avg']:.2f}x | 🔥 Best: {user['best']:.2f}x\n")
+                 f"   📈 Avg: {user['avg']:.2f}x | 🔥 Best: {user['best']:.2f}x\n"
+                 f"   🎯 Win Rate: {user['hit_rate']:.1f}% (>= {WIN_MULTIPLIER}x)\n\n")
 
     buttons = []
     if page > 0:
@@ -200,16 +203,13 @@ async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.edit_text("Leaderboard data expired. Please run /leaderboard again.")
 
 async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Pulls the latest plays and stats for a specific user in this group."""
     if not context.args:
         await update.message.reply_text("Please provide a name. Example: `/caller John`", parse_mode='Markdown')
         return
 
-    # Join args in case the name has a space, and remove the @ symbol if they tagged them
     target = " ".join(context.args).replace("@", "")
     chat_id = update.message.chat_id
     
-    # Search for this user in this specific group (case-insensitive)
     query = {
         "chat_id": chat_id,
         "$or": [
@@ -218,39 +218,95 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     }
     
-    # Get their 5 most recent calls
-    user_calls = list(calls_collection.find(query).sort("timestamp", -1).limit(5))
+    all_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
     
-    if not user_calls:
+    if not all_user_calls:
         await update.message.reply_text(f"I couldn't find any calls for '{target}' in this group.")
         return
 
-    # Update latest prices for these specific 5 calls
-    ca_list = [c['ca'] for c in user_calls]
+    # Calculate overall win rate for this user
+    total_calls = len(all_user_calls)
+    wins = sum(1 for c in all_user_calls if (max(c['ath_mcap'], c.get('current_mcap', 0)) / c['initial_mcap']) >= WIN_MULTIPLIER)
+    hit_rate = (wins / total_calls) * 100
+
+    # Get latest prices for top 5 recent plays to update DB
+    recent_calls = all_user_calls[:5]
+    ca_list = [c['ca'] for c in recent_calls]
     batch_data = get_dexscreener_batch(ca_list)
     
-    actual_name = user_calls[0]['caller_name']
-    text = f"👤 **Recent Plays for {actual_name}** 👤\n\n"
+    actual_name = recent_calls[0]['caller_name']
     
-    for call in user_calls:
+    text = (f"👤 **Profile: {actual_name}** 👤\n"
+            f"📞 Total Calls: {total_calls}\n"
+            f"🎯 Hit Rate (>= {WIN_MULTIPLIER}x): **{hit_rate:.1f}%**\n\n"
+            f"**Recent Plays:**\n\n")
+    
+    for call in recent_calls:
         ca = call['ca']
         current_mcap = batch_data.get(ca.lower(), call['current_mcap'])
         ath = max(call['ath_mcap'], current_mcap)
         
-        # Silently update DB
         calls_collection.update_one({"_id": call['_id']}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
         
         initial = call['initial_mcap']
         call_date = call.get('timestamp', datetime.now(timezone.utc)).strftime('%Y-%m-%d')
-        
-        # Format the CA to be short so the message looks clean (e.g., 0x1234...abcd)
         short_ca = f"{ca[:6]}...{ca[-4:]}"
         
-        text += (f"🪙 `{short_ca}` (Called on {call_date})\n"
+        text += (f"🪙 `{short_ca}` ({call_date})\n"
                  f"🟢 Entry: ${initial:,.0f}\n"
                  f"🔥 ATH: **{(ath/initial):.2f}x** | 💰 Now: **{(current_mcap/initial):.2f}x**\n\n")
 
     await update.message.reply_text(text, parse_mode='Markdown')
+
+async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Generates an overview of the entire group's performance."""
+    chat_id = update.message.chat_id
+    status_message = await update.message.reply_text("🔄 Analyzing group performance...")
+
+    all_calls = list(calls_collection.find({"chat_id": chat_id}))
+    if not all_calls:
+        await status_message.edit_text("No calls tracked in this group yet!")
+        return
+
+    # Calculate Group Stats
+    total_calls = len(all_calls)
+    unique_callers = set()
+    total_wins = 0
+    total_mults = []
+    best_call_x = 0
+    best_call_caller = ""
+    best_call_ca = ""
+
+    for call in all_calls:
+        unique_callers.add(call['caller_name'])
+        
+        # Calculate max multiplier for this call
+        mult = max(call['ath_mcap'], call['current_mcap']) / call['initial_mcap']
+        total_mults.append(mult)
+        
+        if mult >= WIN_MULTIPLIER:
+            total_wins += 1
+            
+        if mult > best_call_x:
+            best_call_x = mult
+            best_call_caller = call['caller_name']
+            best_call_ca = call['ca']
+
+    group_hit_rate = (total_wins / total_calls) * 100
+    group_avg_x = sum(total_mults) / total_calls
+    short_best_ca = f"{best_call_ca[:6]}...{best_call_ca[-4:]}" if best_call_ca else "N/A"
+
+    text = (
+        f"📊 **Group Performance Overview** 📊\n\n"
+        f"👥 **Total Callers:** {len(unique_callers)}\n"
+        f"📞 **Total Calls Tracked:** {total_calls}\n"
+        f"🎯 **Group Win Rate (>= {WIN_MULTIPLIER}x):** {group_hit_rate:.1f}%\n\n"
+        f"📈 **Group Average:** {group_avg_x:.2f}x\n"
+        f"🔥 **Best Call All-Time:** {best_call_x:.2f}x\n"
+        f"   └ By {best_call_caller} (`{short_best_ca}`)"
+    )
+    
+    await status_message.edit_text(text, parse_mode='Markdown')
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -258,7 +314,6 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ca = context.args[0]
-    # ISOLATION: Check stats for how it was called in THIS group
     call = calls_collection.find_one({"ca": ca, "chat_id": update.message.chat_id})
 
     if not call:
@@ -293,11 +348,12 @@ def main():
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("togglealerts", toggle_alerts))
-    app.add_handler(CommandHandler("caller", caller_profile)) # The new specific caller profile command
+    app.add_handler(CommandHandler("caller", caller_profile)) 
+    app.add_handler(CommandHandler("groupstats", group_stats)) # New Command!
     
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern='^lb_'))
     
-    print("YabaiRankBot is running successfully with isolated groups and timeframes!")
+    print("YabaiRankBot is running successfully with performance tracking!")
     app.run_polling()
 
 if __name__ == "__main__":
