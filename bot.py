@@ -13,7 +13,7 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
 WIN_MULTIPLIER = 2.0 
-MIN_CALLS_REQUIRED = 1 # Changed to 1! Everyone gets ranked immediately.
+MIN_CALLS_REQUIRED = 1 # Everyone gets ranked immediately.
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables!")
@@ -46,14 +46,15 @@ def get_dexscreener_batch(cas_list):
 
 async def toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    setting = settings_collection.find_one({"chat_id": chat_id})
+    setting = settings_collection.find_one({"chat_id": chat_id}) or {}
     
-    if not setting or setting.get("alerts", True) == True:
-        settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": False}}, upsert=True)
-        await update.message.reply_text("🔕 **Alerts OFF**: I will track CAs silently here.", parse_mode='Markdown')
-    else:
+    # Alerts are now OFF (False) by default.
+    if not setting.get("alerts", False):
         settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": True}}, upsert=True)
         await update.message.reply_text("🔔 **Alerts ON**: I will announce every new tracked CA here.", parse_mode='Markdown')
+    else:
+        settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": False}}, upsert=True)
+        await update.message.reply_text("🔕 **Alerts OFF**: I will track CAs silently here.", parse_mode='Markdown')
 
 async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message.text
@@ -64,6 +65,9 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     for ca in found_cas:
         existing_call = calls_collection.find_one({"ca": ca, "chat_id": chat_id})
+        
+        # If the CA is already in the database for this chat, completely ignore it silently.
+        # This protects the original caller AND prevents duplicate entries if they repost it.
         if existing_call:
             continue 
         
@@ -84,8 +88,9 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             calls_collection.insert_one(call_data)
             
-            setting = settings_collection.find_one({"chat_id": chat_id})
-            if not setting or setting.get("alerts", True) == True:
+            # Check settings (Default is False, so it stays silent unless toggled ON)
+            setting = settings_collection.find_one({"chat_id": chat_id}) or {}
+            if setting.get("alerts", False):
                 await update.message.reply_text(
                     f"🎯 **New Call Tracked!**\n\n"
                     f"🪙 CA: `{ca}`\n"
@@ -95,7 +100,6 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
 async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
-    """Helper function to calculate rankings for both /leaderboard and /bottom"""
     chat_id = update.message.chat_id
     query = {"chat_id": chat_id}
     time_text = "All Time"
@@ -366,7 +370,7 @@ def main():
     
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern='^lb_'))
     
-    print("YabaiRankBot is running with /bottom and min call limits disabled (set to 1)!")
+    print("YabaiRankBot is running silently by default!")
     app.run_polling()
 
 if __name__ == "__main__":
