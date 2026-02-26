@@ -117,6 +117,11 @@ def stars_from_rank(rank):
     return "★" * filled
 
 
+def stars_from_score(score):
+    filled = int(clamp(round(float(score or 0.0) / 20.0), 0, 5))
+    return ("★" * filled) + ("☆" * (5 - filled))
+
+
 def _text_width(draw, text, font):
     if not text:
         return 0
@@ -336,8 +341,8 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     sub_font = load_font(26, bold=False)
 
     left_x = 60
-    right_x = 700
-    right_w = 430
+    right_x = 760
+    right_w = 350
 
     safe_title = fit_text(draw, title, sub_font, 620)
     safe_name = fit_text(draw, top_name, block_font, 560)
@@ -346,15 +351,15 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     draw.text((left_x + 2, 112), safe_title, font=sub_font, fill=(161, 203, 235))
 
     draw.text((left_x, 175), f"#1 {safe_name}", font=block_font, fill=(255, 255, 255))
-    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg} • Best {top_best}", stat_font, 620), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg} • Best {top_best}", stat_font, 600), font=stat_font, fill=(141, 255, 113))
     draw.text((left_x, 304), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
 
     draw.text((right_x, 180), "Best Win Window", font=block_font, fill=(204, 231, 255))
-    lines = wrap_text_lines(draw, ascii_safe(best_win_text, fallback="N/A"), sub_font, right_w, max_lines=3)
+    lines = wrap_text_lines(draw, ascii_safe(best_win_text, fallback="N/A"), sub_font, right_w, max_lines=4)
     y = 228
     for line in lines:
         draw.text((right_x, y), line, font=sub_font, fill=(255, 255, 255))
-        y += 38
+        y += 34
 
     buffer = BytesIO()
     card.save(buffer, format="PNG", optimize=True)
@@ -508,6 +513,7 @@ def derive_user_metrics(calls):
 
 
 def derive_rug_stats(calls):
+    total = 0
     eligible = 0
     rug_count = 0
     now = utc_now()
@@ -516,6 +522,7 @@ def derive_rug_stats(calls):
         initial = float(call.get("initial_mcap", 0) or 0)
         if initial <= 0:
             continue
+        total += 1
 
         ts = call.get("timestamp")
         if not ts:
@@ -535,8 +542,13 @@ def derive_rug_stats(calls):
         if ath_x < RUG_ATH_MAX_X and current_x <= RUG_CURRENT_MAX_X:
             rug_count += 1
 
-    rug_rate = (rug_count / eligible) * 100.0 if eligible > 0 else 0.0
-    return {"rug_rate": rug_rate, "rug_count": rug_count, "eligible": eligible}
+    rug_rate = (rug_count / total) * 100.0 if total > 0 else 0.0
+    return {
+        "rug_rate": rug_rate,
+        "rug_count": rug_count,
+        "total": total,
+        "eligible": eligible,
+    }
 
 
 def call_is_duplicate(chat_id, ca_norm):
@@ -1226,11 +1238,13 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     caller_id = recent_calls[0].get("caller_id")
     win_pct = metrics["win_rate"] * 100
+    caller_penalty = get_reputation_penalty(chat_id, caller_id) if caller_id is not None else 0.0
+    caller_score = max(0.0, metrics["reputation"] - caller_penalty)
     recent_cas_norm = [c.get("ca_norm", normalize_ca(c.get("ca", ""))) for c in recent_calls if c.get("ca")]
     recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
     avg_text = format_return(1 + metrics["avg_now"])
     best_text = format_return(metrics["best_x"])
-    stars = stars_from_pct(win_pct)
+    stars = stars_from_score(caller_score)
 
     lines = [
         f"👤 {html.escape(actual_name)}  {stars}",
@@ -1238,7 +1252,8 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📞 Calls: {metrics['calls']}",
         f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
         f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%",
-        f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['eligible']})",
+        f"⭐ Score: {caller_score:.1f}/100",
+        f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})",
         f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
         "",
         "📚 Recent 5 Calls",
@@ -1307,11 +1322,12 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     refresh_calls_market_data(user_calls)
     metrics = derive_user_metrics(user_calls)
+    rug = derive_rug_stats(user_calls)
 
     penalty = get_reputation_penalty(chat_id, user.id)
     win_pct = metrics["win_rate"] * 100
     score = max(0.0, metrics["reputation"] - penalty)
-    stars = stars_from_pct(win_pct)
+    stars = stars_from_score(score)
 
     text = (
         f"📈 Your Performance  {stars}\n"
@@ -1320,6 +1336,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Avg: {format_return(1 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
         f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%\n"
         f"⭐ Score: {score:.1f}/100\n"
+        f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})\n"
         f"🏅 Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
     )
     await update.effective_message.reply_text(text)
