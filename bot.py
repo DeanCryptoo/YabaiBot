@@ -117,6 +117,49 @@ def stars_from_rank(rank):
     return "★" * filled
 
 
+def _text_width(draw, text, font):
+    if not text:
+        return 0
+    left, _, right, _ = draw.textbbox((0, 0), str(text), font=font)
+    return right - left
+
+
+def fit_text(draw, text, font, max_width):
+    text = str(text or "")
+    if _text_width(draw, text, font) <= max_width:
+        return text
+    if max_width <= 20:
+        return ""
+    trimmed = text
+    while len(trimmed) > 1 and _text_width(draw, trimmed + "...", font) > max_width:
+        trimmed = trimmed[:-1]
+    return (trimmed + "...") if trimmed else ""
+
+
+def wrap_text_lines(draw, text, font, max_width, max_lines=2):
+    words = str(text or "").split()
+    if not words:
+        return [""]
+    lines = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if _text_width(draw, candidate, font) <= max_width:
+            current = candidate
+        else:
+            if current:
+                lines.append(current)
+            current = word
+            if len(lines) >= max_lines - 1:
+                break
+    if current and len(lines) < max_lines:
+        lines.append(current)
+
+    if len(lines) == max_lines:
+        lines[-1] = fit_text(draw, lines[-1], font, max_width)
+    return lines
+
+
 def format_return(x_value):
     if isinstance(x_value, str):
         raw = x_value.strip().lower()
@@ -281,19 +324,31 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     card = Image.alpha_composite(card.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(card)
 
-    title_font = load_font(54, bold=True)
-    block_font = load_font(34, bold=True)
-    stat_font = load_font(58, bold=True)
-    sub_font = load_font(29, bold=False)
+    title_font = load_font(46, bold=True)
+    block_font = load_font(30, bold=True)
+    stat_font = load_font(49, bold=True)
+    sub_font = load_font(26, bold=False)
 
-    draw.text((60, 54), "🏆 LEADERBOARD SPOTLIGHT", font=title_font, fill=(241, 247, 255))
-    draw.text((62, 120), title, font=sub_font, fill=(161, 203, 235))
+    left_x = 60
+    right_x = 700
+    right_w = 430
 
-    draw.text((60, 185), f"1) {top_name}", font=block_font, fill=(255, 255, 255))
-    draw.text((60, 240), f"Avg {top_avg} • Best {top_best}", font=stat_font, fill=(141, 255, 113))
-    draw.text((60, 320), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
-    draw.text((680, 210), "Best Win Window", font=block_font, fill=(204, 231, 255))
-    draw.text((680, 265), best_win_text, font=block_font, fill=(255, 255, 255))
+    safe_title = fit_text(draw, title, sub_font, 620)
+    safe_name = fit_text(draw, top_name, block_font, 560)
+
+    draw.text((left_x, 54), "🏆 LEADERBOARD SPOTLIGHT", font=title_font, fill=(241, 247, 255))
+    draw.text((left_x + 2, 112), safe_title, font=sub_font, fill=(161, 203, 235))
+
+    draw.text((left_x, 175), f"1) {safe_name}", font=block_font, fill=(255, 255, 255))
+    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg} • Best {top_best}", stat_font, 620), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 304), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
+
+    draw.text((right_x, 180), "Best Win Window", font=block_font, fill=(204, 231, 255))
+    lines = wrap_text_lines(draw, best_win_text, sub_font, right_w, max_lines=3)
+    y = 228
+    for line in lines:
+        draw.text((right_x, y), line, font=sub_font, fill=(255, 255, 255))
+        y += 38
 
     buffer = BytesIO()
     card.save(buffer, format="PNG", optimize=True)
@@ -1029,6 +1084,7 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
     context.chat_data["leaderboard_title"] = title
     context.chat_data["leaderboard_data"] = leaderboard_data
     context.chat_data["leaderboard_best_win"] = best_win_text
+    context.chat_data["leaderboard_image_mode"] = False
 
     if not is_bottom:
         try:
@@ -1041,12 +1097,19 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
                 top_win_rate=top["win_rate"],
                 best_win_text=best_win_text,
             )
-            await update.effective_message.reply_photo(
+            context.chat_data["leaderboard_image_mode"] = True
+            photo_message = await update.effective_message.reply_photo(
                 photo=spotlight,
-                caption=f"🌟 Spotlight ({time_text})",
+                caption="Loading leaderboard...",
             )
+            try:
+                await status_message.delete()
+            except Exception:
+                pass
+            await render_leaderboard_page(photo_message, context, page=0)
+            return
         except Exception:
-            pass
+            context.chat_data["leaderboard_image_mode"] = False
 
     await render_leaderboard_page(status_message, context, page=0)
 
@@ -1063,8 +1126,8 @@ async def render_leaderboard_page(message_obj, context, page=0):
     data = context.chat_data.get("leaderboard_data", [])
     title = context.chat_data.get("leaderboard_title", "Leaderboard")
     best_win_text = context.chat_data.get("leaderboard_best_win", "N/A")
-
-    items_per_page = 10
+    image_mode = bool(context.chat_data.get("leaderboard_image_mode", False))
+    items_per_page = 6 if image_mode else 10
     total_pages = max(1, math.ceil(len(data) / items_per_page))
 
     start_idx = page * items_per_page
@@ -1090,6 +1153,8 @@ async def render_leaderboard_page(message_obj, context, page=0):
         lines.append("────────────────")
 
     text = "\n".join(lines).strip()
+    if image_mode and len(text) > 1020:
+        text = text[:1017] + "..."
 
     buttons = []
     if page > 0:
@@ -1100,7 +1165,10 @@ async def render_leaderboard_page(message_obj, context, page=0):
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
 
     try:
-        await message_obj.edit_text(text, reply_markup=reply_markup)
+        if image_mode:
+            await message_obj.edit_caption(caption=text, reply_markup=reply_markup)
+        else:
+            await message_obj.edit_text(text, reply_markup=reply_markup)
     except Exception:
         pass
 
