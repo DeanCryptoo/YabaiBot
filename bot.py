@@ -33,6 +33,9 @@ STREAK_LOOKBACK = 8
 ACTIVE_CALL_WINDOW_HOURS = 1
 ALERT_COOLDOWN_HOURS = 4
 DIGEST_HOUR_UTC = 12
+RUG_ATH_MAX_X = 1.20
+RUG_CURRENT_MAX_X = 0.30
+RUG_MIN_AGE_HOURS = 12
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -297,6 +300,38 @@ def derive_user_metrics(calls):
         "best_x": best_x,
         "badges": badges,
     }
+
+
+def derive_rug_stats(calls):
+    eligible = 0
+    rug_count = 0
+    now = utc_now()
+
+    for call in calls:
+        initial = float(call.get("initial_mcap", 0) or 0)
+        if initial <= 0:
+            continue
+
+        ts = call.get("timestamp")
+        if not ts:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_hours = (now - ts).total_seconds() / 3600.0
+        if age_hours < RUG_MIN_AGE_HOURS:
+            continue
+
+        current = float(call.get("current_mcap", initial) or initial)
+        ath = float(max(call.get("ath_mcap", initial) or initial, current))
+        ath_x = ath / initial
+        current_x = current / initial
+
+        eligible += 1
+        if ath_x < RUG_ATH_MAX_X and current_x <= RUG_CURRENT_MAX_X:
+            rug_count += 1
+
+    rug_rate = (rug_count / eligible) * 100.0 if eligible > 0 else 0.0
+    return {"rug_rate": rug_rate, "rug_count": rug_count, "eligible": eligible}
 
 
 def call_is_duplicate(chat_id, ca_norm):
@@ -908,6 +943,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     refresh_calls_market_data(all_user_calls)
     metrics = derive_user_metrics(all_user_calls)
+    rug = derive_rug_stats(all_user_calls)
 
     recent_calls = all_user_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
@@ -923,6 +959,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📞 Total Calls: {metrics['calls']}",
         f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
         f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%",
+        f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['eligible']})",
         f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
         "",
         "Recent Calls:",
