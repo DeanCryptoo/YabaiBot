@@ -1,6 +1,7 @@
 import os
 import re
 import math
+import html
 import requests
 import certifi
 from datetime import datetime, timedelta, timezone
@@ -77,7 +78,24 @@ def short_ca(ca):
     return f"{ca[:6]}...{ca[-4:]}"
 
 
-def get_dexscreener_batch(cas_list):
+def format_return(x_value):
+    x_value = float(x_value or 0.0)
+    if x_value >= 2.0:
+        return f"{x_value:.2f}x"
+    pct = (x_value - 1.0) * 100.0
+    if abs(pct) < 0.05:
+        pct = 0.0
+    return f"{pct:.1f}%"
+
+
+def token_label(symbol, ca):
+    symbol = (symbol or "").strip()
+    if symbol:
+        return f"${symbol.upper()}"
+    return short_ca(ca)
+
+
+def get_dexscreener_batch_meta(cas_list):
     results = {}
     if not cas_list:
         return results
@@ -92,14 +110,23 @@ def get_dexscreener_batch(cas_list):
             if payload and payload.get("pairs"):
                 for pair in payload["pairs"]:
                     address = pair.get("baseToken", {}).get("address")
+                    symbol = pair.get("baseToken", {}).get("symbol") or ""
                     fdv = pair.get("fdv", 0)
                     if address and fdv and fdv > 0:
                         addr_lower = address.lower()
-                        if addr_lower not in results or fdv > results[addr_lower]:
-                            results[addr_lower] = float(fdv)
+                        if addr_lower not in results or fdv > results[addr_lower]["fdv"]:
+                            results[addr_lower] = {
+                                "fdv": float(fdv),
+                                "symbol": symbol.upper() if symbol else "",
+                            }
         except Exception as exc:
             print(f"DexScreener batch fetch error: {exc}")
     return results
+
+
+def get_dexscreener_batch(cas_list):
+    meta = get_dexscreener_batch_meta(cas_list)
+    return {addr: data["fdv"] for addr, data in meta.items()}
 
 
 def update_user_profile(chat_id, user, event_type, reason=None):
@@ -307,8 +334,10 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_user_profile(chat_id, user, "rejected", reason=rejection_reason)
             continue
 
-        batch_data = get_dexscreener_batch([ca_norm])
-        mcap = batch_data.get(ca_norm)
+        batch_data = get_dexscreener_batch_meta([ca_norm])
+        token_meta = batch_data.get(ca_norm, {})
+        mcap = token_meta.get("fdv")
+        symbol = token_meta.get("symbol", "")
 
         if mcap and mcap > 0:
             call_data = {
@@ -322,6 +351,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "initial_mcap": mcap,
                 "ath_mcap": mcap,
                 "current_mcap": mcap,
+                "token_symbol": symbol,
                 "timestamp": now,
                 "message_id": message_obj.message_id,
                 "message_date": msg_time,
@@ -333,7 +363,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             setting = settings_collection.find_one({"chat_id": chat_id}) or {}
             if setting.get("alerts", False):
                 await message_obj.reply_text(
-                    f"New call tracked\nCA: {ca_norm}\nCaller: {user.first_name}\nEntry MCAP: ${mcap:,.2f}"
+                    f"New call tracked\nToken: {token_label(symbol, ca_norm)}\nCA: {ca_norm}\nCaller: {user.first_name}\nEntry MCAP: ${mcap:,.2f}"
                 )
 
 
@@ -363,17 +393,23 @@ def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
 
 def refresh_calls_market_data(calls):
     unique_cas = list({call.get("ca_norm", normalize_ca(call["ca"])) for call in calls if call.get("ca")})
-    latest_mcaps = get_dexscreener_batch(unique_cas)
+    latest_meta = get_dexscreener_batch_meta(unique_cas)
 
     for call in calls:
         ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
-        current_mcap = latest_mcaps.get(ca_norm, call.get("current_mcap", call.get("initial_mcap", 0)))
+        meta = latest_meta.get(ca_norm, {})
+        current_mcap = meta.get("fdv", call.get("current_mcap", call.get("initial_mcap", 0)))
         if not current_mcap:
             continue
         ath = max(float(call.get("ath_mcap", current_mcap)), float(current_mcap))
-        calls_collection.update_one({"_id": call["_id"]}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
+        update_fields = {"current_mcap": current_mcap, "ath_mcap": ath}
+        if meta.get("symbol"):
+            update_fields["token_symbol"] = meta["symbol"]
+        calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
         call["current_mcap"] = current_mcap
         call["ath_mcap"] = ath
+        if meta.get("symbol"):
+            call["token_symbol"] = meta["symbol"]
 
 
 async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
@@ -470,7 +506,7 @@ async def render_leaderboard_page(message_obj, context, page=0):
     for idx, row in enumerate(page_data, start=start_idx + 1):
         lines.append(
             f"{idx}. {row['name']} ({row['calls']} calls)\n"
-            f"   📈 Avg: {row['avg_now_x']:.2f}x | 🔥 Best: {row['best_x']:.2f}x\n"
+            f"   📈 Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
             f"   🎯 Win Rate: {row['win_rate']:.1f}%"
         )
         lines.append("")
@@ -533,13 +569,17 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent_calls = all_user_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     win_pct = metrics["win_rate"] * 100
+    recent_cas_norm = [c.get("ca_norm", normalize_ca(c.get("ca", ""))) for c in recent_calls if c.get("ca")]
+    recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
+    avg_text = format_return(1 + metrics["avg_now"])
+    best_text = format_return(metrics["best_x"])
 
     lines = [
-        f"👤 Caller Profile: {actual_name}",
+        f"👤 Caller Profile: {html.escape(actual_name)}",
         f"📞 Total Calls: {metrics['calls']}",
-        f"📈 Avg: {1 + metrics['avg_now']:.2f}x | 🔥 Best: {metrics['best_x']:.2f}x",
+        f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
         f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%",
-        f"🏅 Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}",
+        f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
         "",
         "Recent Calls:",
     ]
@@ -552,13 +592,16 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if initial <= 0:
             continue
         call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
-        s_ca = short_ca(ca)
+        ca_norm = call.get("ca_norm", normalize_ca(ca))
+        symbol = recent_meta.get(ca_norm, {}).get("symbol") or call.get("token_symbol", "")
+        token = token_label(symbol, ca)
         lines.append(
-            f"• {s_ca} ({call_date})\n"
-            f"   📈 ATH: {(ath / initial):.2f}x | 💰 Now: {(current / initial):.2f}x"
+            f"• {html.escape(token)} ({call_date})\n"
+            f"   📈 ATH: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
+            f"   <code>{html.escape(ca)}</code>"
         )
 
-    await update.effective_message.reply_text("\n".join(lines))
+    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
 async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -589,7 +632,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         f"📈 Your Performance\n\n"
         f"📞 Total Calls: {metrics['calls']}\n"
-        f"📈 Avg: {1 + metrics['avg_now']:.2f}x | 🔥 Best: {metrics['best_x']:.2f}x\n"
+        f"📈 Avg: {format_return(1 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
         f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%\n"
         f"⭐ Score: {score:.1f}/100\n"
         f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
@@ -624,9 +667,13 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         initial = float(best_call.get("initial_mcap", 1) or 1)
         best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
         ca = best_call.get("ca", "")
+        ca_norm = best_call.get("ca_norm", normalize_ca(ca))
+        best_meta = get_dexscreener_batch_meta([ca_norm]).get(ca_norm, {})
+        symbol = best_meta.get("symbol") or best_call.get("token_symbol", "")
+        token = token_label(symbol, ca)
         best_caller = best_call.get("caller_name", "Unknown")
-        best_text = f"{best_x:.2f}x"
-        best_by_text = f"   └ By {best_caller} ({short_ca(ca)})"
+        best_text = format_return(best_x)
+        best_by_text = f"   └ By {html.escape(best_caller)} ({html.escape(token)})\n   <code>{html.escape(ca)}</code>"
     else:
         best_by_text = "   └ By N/A"
 
@@ -635,12 +682,12 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 Total Callers: {len(unique_callers)}\n"
         f"📞 Total Calls Tracked: {total_calls}\n"
         f"🎯 Group Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n\n"
-        f"📈 Group Average: {1 + group_metrics['avg_now']:.2f}x\n"
+        f"📈 Group Average: {format_return(1 + group_metrics['avg_now'])}\n"
         f"🔥 Best Call All-Time: {best_text}\n"
         f"{best_by_text}"
     )
 
-    await status_message.edit_text(text)
+    await status_message.edit_text(text, parse_mode="HTML")
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -672,28 +719,34 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.effective_message.reply_text("This CA is not tracked in this group yet")
         return
 
-    batch_data = get_dexscreener_batch([ca])
-    current_mcap = batch_data.get(ca)
+    batch_data = get_dexscreener_batch_meta([ca])
+    token_meta = batch_data.get(ca, {})
+    current_mcap = token_meta.get("fdv")
+    symbol = token_meta.get("symbol") or call.get("token_symbol", "")
 
     if not current_mcap:
         await update.effective_message.reply_text("Failed to fetch current data from DexScreener")
         return
 
     ath = max(float(call.get("ath_mcap", current_mcap) or current_mcap), float(current_mcap))
-    calls_collection.update_one({"_id": call["_id"]}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
+    update_fields = {"current_mcap": current_mcap, "ath_mcap": ath}
+    if symbol:
+        update_fields["token_symbol"] = symbol
+    calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
 
     initial = float(call.get("initial_mcap", 1) or 1)
     current_x = current_mcap / initial
     ath_x = ath / initial
 
     text = (
-        f"Token stats\n{ca}\n\n"
-        f"Called by: {call.get('caller_name', 'Unknown')}\n"
-        f"Entry MCAP: ${initial:,.2f}\n"
-        f"ATH: ${ath:,.2f} ({ath_x:.2f}x)\n"
-        f"Current: ${current_mcap:,.2f} ({current_x:.2f}x)"
+        f"🪙 Token: {html.escape(token_label(symbol, ca))}\n"
+        f"<code>{html.escape(ca)}</code>\n\n"
+        f"👤 Called by: {html.escape(call.get('caller_name', 'Unknown'))}\n"
+        f"📈 ATH: {format_return(ath_x)}\n"
+        f"💰 Current: {format_return(current_x)}\n"
+        f"🏁 Entry MCAP: ${initial:,.2f}"
     )
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -799,7 +852,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if low_performers:
         for row in low_performers[:5]:
             lines.append(
-                f"- {row['name']}: win {row['win_rate']:.1f}%, avg {row['avg_now_x']:.2f}x, calls {row['calls']}"
+                f"- {row['name']}: win {row['win_rate']:.1f}%, avg {format_return(row['avg_now_x'])}, calls {row['calls']}"
             )
     else:
         lines.append("- None")
