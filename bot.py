@@ -79,7 +79,20 @@ def short_ca(ca):
 
 
 def format_return(x_value):
-    x_value = float(x_value or 0.0)
+    if isinstance(x_value, str):
+        raw = x_value.strip().lower()
+        try:
+            if raw.endswith("x"):
+                x_value = float(raw[:-1])
+            elif raw.endswith("%"):
+                x_value = 1.0 + (float(raw[:-1]) / 100.0)
+            else:
+                x_value = float(raw)
+        except ValueError:
+            x_value = 0.0
+    else:
+        x_value = float(x_value or 0.0)
+
     if x_value >= 2.0:
         return f"{x_value:.2f}x"
     pct = (x_value - 1.0) * 100.0
