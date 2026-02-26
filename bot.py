@@ -38,6 +38,8 @@ DIGEST_HOUR_UTC = 12
 RUG_ATH_MAX_X = 1.20
 RUG_CURRENT_MAX_X = 0.30
 RUG_MIN_AGE_HOURS = 12
+ATH_TRACK_WINDOW_DAYS = 7
+ATH_TRACK_MAX_CALLS_PER_CHAT = 800
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -791,6 +793,59 @@ def _accepted_query(chat_id, extra=None):
     return query
 
 
+def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
+    cutoff = utc_now() - timedelta(days=lookback_days)
+    calls = list(
+        calls_collection.find(
+            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})
+        )
+        .sort("timestamp", -1)
+        .limit(limit)
+    )
+    if not calls:
+        return 0
+    refresh_calls_market_data(calls)
+    return len(calls)
+
+
+def refresh_all_call_peaks(chat_id):
+    calls = list(calls_collection.find(_accepted_query(chat_id)))
+    if not calls:
+        return {"calls": 0, "tokens": 0, "updated": 0}
+    tokens = len({call.get("ca_norm", normalize_ca(call.get("ca", ""))) for call in calls if call.get("ca")})
+    updated = refresh_calls_market_data(calls)
+    return {"calls": len(calls), "tokens": tokens, "updated": updated}
+
+
+def bump_live_ath_for_chat(chat_id, token_meta_map):
+    if not token_meta_map:
+        return {"matched": 0, "modified": 0}
+
+    total_matched = 0
+    total_modified = 0
+    for ca_norm, token_meta in token_meta_map.items():
+        mcap = float(token_meta.get("fdv", 0) or 0)
+        if mcap <= 0:
+            continue
+
+        update_doc = {
+            "$set": {"current_mcap": mcap},
+            "$max": {"ath_mcap": mcap},
+        }
+        symbol = token_meta.get("symbol")
+        if symbol:
+            update_doc["$set"]["token_symbol"] = symbol
+
+        result = calls_collection.update_many(
+            _accepted_query(chat_id, {"ca_norm": ca_norm}),
+            update_doc,
+        )
+        total_matched += int(result.matched_count or 0)
+        total_modified += int(result.modified_count or 0)
+
+    return {"matched": total_matched, "modified": total_modified}
+
+
 async def run_streak_scan_for_chat(bot, chat_id, manual=False):
     setting = settings_collection.find_one({"chat_id": chat_id}) or {}
     if not manual and not setting.get("alerts", False):
@@ -1114,6 +1169,7 @@ async def heartbeat_loop(application: Application):
             chat_ids = get_tracked_chat_ids()
             for chat_id in chat_ids:
                 try:
+                    refresh_recent_call_peaks(chat_id)
                     await run_streak_scan_for_chat(application.bot, chat_id, manual=False)
                     await send_daily_digest(application.bot, chat_id, manual=False)
                 except Exception as exc:
@@ -1168,6 +1224,9 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_cas = {normalize_ca(ca) for ca in re.findall(CA_REGEX, text)}
     if not found_cas:
         return
+    found_cas_list = sorted(found_cas)
+    batch_data = get_dexscreener_batch_meta(found_cas_list)
+    bump_live_ath_for_chat(chat_id, batch_data)
 
     is_edited = update.edited_message is not None
 
@@ -1177,7 +1236,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg_time = msg_time.replace(tzinfo=timezone.utc)
     delay_seconds = max(0, int((now - msg_time).total_seconds()))
 
-    for ca_norm in found_cas:
+    for ca_norm in found_cas_list:
         rejection_reason = None
 
         if is_edited:
@@ -1207,7 +1266,6 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update_user_profile(chat_id, user, "rejected", reason=rejection_reason)
             continue
 
-        batch_data = get_dexscreener_batch_meta([ca_norm])
         token_meta = batch_data.get(ca_norm, {})
         mcap = token_meta.get("fdv")
         symbol = token_meta.get("symbol", "")
@@ -1260,7 +1318,10 @@ def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
 
 def refresh_calls_market_data(calls):
     unique_cas = list({call.get("ca_norm", normalize_ca(call["ca"])) for call in calls if call.get("ca")})
+    if not unique_cas:
+        return 0
     latest_meta = get_dexscreener_batch_meta(unique_cas)
+    updated = 0
 
     for call in calls:
         ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
@@ -1272,11 +1333,13 @@ def refresh_calls_market_data(calls):
         update_fields = {"current_mcap": current_mcap, "ath_mcap": ath}
         if meta.get("symbol"):
             update_fields["token_symbol"] = meta["symbol"]
-        calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
+        result = calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
+        updated += int(result.modified_count or 0)
         call["current_mcap"] = current_mcap
         call["ath_mcap"] = ath
         if meta.get("symbol"):
             call["token_symbol"] = meta["symbol"]
+    return updated
 
 
 async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
@@ -1532,7 +1595,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = token_label(symbol, ca)
         lines.append(
             f"• {html.escape(token)} ({call_date})\n"
-            f"   📈 ATH: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
+            f"   📈 Peak: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
             f"   <code>{html.escape(ca)}</code>"
         )
         lines.append("────────────────")
@@ -1939,10 +2002,13 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("📊 Group Mini Chart", callback_data="admin_group_chart"),
                 InlineKeyboardButton("🏆 Top Caller Chart", callback_data="admin_top_caller_chart"),
             ],
+            [
+                InlineKeyboardButton("⚡ Refresh All ATH Now", callback_data="admin_refresh_ath"),
+            ],
         ]
     )
     await update.effective_message.reply_text(
-        "🛠️ ADMIN TEST PANEL\n────────────────\nTrigger streaks, digest, and chart events safely.",
+        "🛠️ ADMIN TEST PANEL\n────────────────\nTrigger streaks, digest, chart events, and ATH refresh safely.",
         reply_markup=keyboard,
     )
 
@@ -1974,6 +2040,17 @@ async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("No top caller found for chart.")
             return
         await send_caller_mini_chart(context, chat_id, caller_id)
+    elif action == "admin_refresh_ath":
+        stats = refresh_all_call_peaks(chat_id)
+        if stats["calls"] == 0:
+            await query.message.reply_text("No tracked calls to refresh.")
+            return
+        await query.message.reply_text(
+            "⚡ ATH REFRESH COMPLETE\n────────────────\n"
+            f"Calls scanned: {stats['calls']}\n"
+            f"Tokens scanned: {stats['tokens']}\n"
+            f"Records updated: {stats['updated']}"
+        )
 
 
 async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
