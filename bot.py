@@ -91,6 +91,23 @@ def short_ca(ca):
     return f"{ca[:6]}...{ca[-4:]}"
 
 
+def rank_badge(rank):
+    if rank == 1:
+        return "🥇"
+    if rank == 2:
+        return "🥈"
+    if rank == 3:
+        return "🥉"
+    if 4 <= rank <= 10:
+        return f"{rank}️⃣"
+    return f"{rank}."
+
+
+def stars_from_pct(pct):
+    stars = int(clamp(round(float(pct or 0.0) / 20.0), 0, 5))
+    return ("★" * stars) + ("☆" * (5 - stars))
+
+
 def format_return(x_value):
     if isinstance(x_value, str):
         raw = x_value.strip().lower()
@@ -879,15 +896,17 @@ async def render_leaderboard_page(message_obj, context, page=0):
     end_idx = start_idx + items_per_page
     page_data = data[start_idx:end_idx]
 
-    lines = [f"🏆 {title} 🏆", f"Page {page + 1}/{total_pages}", ""]
+    lines = [f"🏆 {title.upper()}", f"📄 Page {page + 1}/{total_pages}", "────────────────"]
 
     for idx, row in enumerate(page_data, start=start_idx + 1):
+        badge = rank_badge(idx)
+        stars = stars_from_pct(row["win_rate"])
         lines.append(
-            f"{idx}. {row['name']} ({row['calls']} calls)\n"
-            f"   📈 Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
-            f"   🎯 Win Rate: {row['win_rate']:.1f}%"
+            f"{badge} {row['name']} {stars}\n"
+            f"↳ 📈 Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
+            f"↳ 🎯 Win: {row['win_rate']:.1f}% | 📞 Calls: {row['calls']}"
         )
-        lines.append("")
+        lines.append("────────────────")
 
     text = "\n".join(lines).strip()
 
@@ -953,16 +972,19 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
     avg_text = format_return(1 + metrics["avg_now"])
     best_text = format_return(metrics["best_x"])
+    stars = stars_from_pct(win_pct)
 
     lines = [
-        f"👤 Caller Profile: {html.escape(actual_name)}",
-        f"📞 Total Calls: {metrics['calls']}",
+        f"👤 {html.escape(actual_name)}  {stars}",
+        "────────────────",
+        f"📞 Calls: {metrics['calls']}",
         f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
-        f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%",
+        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%",
         f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['eligible']})",
         f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
         "",
-        "Recent Calls:",
+        "📚 Recent 5 Calls",
+        "────────────────",
     ]
 
     for call in recent_calls:
@@ -981,7 +1003,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   📈 ATH: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
             f"   <code>{html.escape(ca)}</code>"
         )
-        lines.append("")
+        lines.append("────────────────")
 
     reply_markup = None
     if caller_id is not None:
@@ -1020,14 +1042,16 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     penalty = get_reputation_penalty(chat_id, user.id)
     win_pct = metrics["win_rate"] * 100
     score = max(0.0, metrics["reputation"] - penalty)
+    stars = stars_from_pct(win_pct)
 
     text = (
-        f"📈 Your Performance\n\n"
-        f"📞 Total Calls: {metrics['calls']}\n"
+        f"📈 Your Performance  {stars}\n"
+        f"────────────────\n"
+        f"📞 Calls: {metrics['calls']}\n"
         f"📈 Avg: {format_return(1 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
-        f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%\n"
+        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%\n"
         f"⭐ Score: {score:.1f}/100\n"
-        f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
+        f"🏅 Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
     )
     await update.effective_message.reply_text(text)
 
@@ -1071,12 +1095,12 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_by_text = "   └ By N/A"
 
     text = (
-        f"📊 Group Performance Overview ({time_text}) 📊\n\n"
-        f"👥 Total Callers: {len(unique_callers)}\n"
-        f"📞 Total Calls Tracked: {total_calls}\n"
-        f"🎯 Group Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n\n"
-        f"📈 Group Average: {format_return(1 + group_metrics['avg_now'])}\n"
-        f"🔥 Best Call All-Time: {best_text}\n"
+        f"📊 Group Performance ({time_text.upper()})\n"
+        f"────────────────\n"
+        f"👥 Callers: {len(unique_callers)} | 📞 Calls: {total_calls}\n"
+        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {group_metrics['win_rate'] * 100:.1f}%\n"
+        f"📈 Group Avg: {format_return(1 + group_metrics['avg_now'])}\n"
+        f"🔥 Best Call: {best_text}\n"
         f"{best_by_text}"
     )
 
@@ -1159,11 +1183,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "🛡️ Admin Panel",
-        f"Accepted: {accepted} | Rejected: {rejected}",
-        f"Acceptance: {(accepted / (accepted + rejected) * 100) if (accepted + rejected) else 0:.1f}%",
-        f"Delay avg/max: {avg_delay:.1f}s / {max_delay:.0f}s",
+        "────────────────",
+        f"✅ Accepted: {accepted} | ❌ Rejected: {rejected}",
+        f"🎯 Acceptance: {(accepted / (accepted + rejected) * 100) if (accepted + rejected) else 0:.1f}%",
+        f"⏱ Delay avg/max: {avg_delay:.1f}s / {max_delay:.0f}s",
         "",
-        "Reject Reasons",
+        "🚫 Reject Reasons",
+        "────────────────",
     ]
 
     if reason_counts:
@@ -1173,7 +1199,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("- None")
 
     lines.append("")
-    lines.append("Spam Watchlist")
+    lines.append("🕵️ Spam Watchlist")
+    lines.append("────────────────")
     if suspicious:
         for row in suspicious:
             name = row.get("display_name", "Unknown")
@@ -1185,7 +1212,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("- None")
 
     lines.append("")
-    lines.append("Low Performers (>=3 calls)")
+    lines.append("📉 Low Performers (>=3 calls)")
+    lines.append("────────────────")
     if low_performers:
         for row in low_performers[:5]:
             lines.append(
