@@ -337,7 +337,7 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
 
     title_font = load_font(46, bold=True)
     block_font = load_font(30, bold=True)
-    stat_font = load_font(49, bold=True)
+    stat_font = load_font(42, bold=True)
     sub_font = load_font(26, bold=False)
 
     left_x = 60
@@ -351,8 +351,9 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     draw.text((left_x + 2, 112), safe_title, font=sub_font, fill=(161, 203, 235))
 
     draw.text((left_x, 175), f"#1 {safe_name}", font=block_font, fill=(255, 255, 255))
-    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg} • Best {top_best}", stat_font, 600), font=stat_font, fill=(141, 255, 113))
-    draw.text((left_x, 304), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
+    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 276), fit_text(draw, f"Best {top_best}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 330), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
 
     draw.text((right_x, 180), "Best Win Window", font=block_font, fill=(204, 231, 255))
     lines = wrap_text_lines(draw, ascii_safe(best_win_text, fallback="N/A"), sub_font, right_w, max_lines=4)
