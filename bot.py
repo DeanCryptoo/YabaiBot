@@ -2,8 +2,11 @@ import os
 import re
 import math
 import html
+import json
+import asyncio
 import requests
 import certifi
+from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
@@ -23,6 +26,13 @@ MONGO_URI = os.getenv("MONGO_URI")
 WIN_MULTIPLIER = 2.0
 MIN_CALLS_REQUIRED = 1
 MAX_CALL_DELAY_SECONDS = 120
+HEARTBEAT_INTERVAL_SECONDS = 600
+HOT_STREAK_MIN = 4
+COLD_STREAK_MIN = 6
+STREAK_LOOKBACK = 8
+ACTIVE_CALL_WINDOW_HOURS = 1
+ALERT_COOLDOWN_HOURS = 4
+DIGEST_HOUR_UTC = 12
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -106,6 +116,42 @@ def token_label(symbol, ca):
     if symbol:
         return f"${symbol.upper()}"
     return short_ca(ca)
+
+
+def quickchart_url(chart_config):
+    payload = quote(json.dumps(chart_config, separators=(",", ":")))
+    return f"https://quickchart.io/chart?c={payload}"
+
+
+def build_performance_chart_url(title, win_rate_pct, profitable_pct, avg_x):
+    avg_return_pct = (float(avg_x) - 1.0) * 100.0
+    chart = {
+        "type": "bar",
+        "data": {
+            "labels": ["Win Rate %", "Profitable %", "Avg Return %"],
+            "datasets": [
+                {
+                    "label": "Performance",
+                    "backgroundColor": ["#38bdf8", "#4ade80", "#f59e0b"],
+                    "data": [
+                        round(float(win_rate_pct), 2),
+                        round(float(profitable_pct), 2),
+                        round(avg_return_pct, 2),
+                    ],
+                }
+            ],
+        },
+        "options": {
+            "plugins": {
+                "title": {"display": True, "text": title},
+                "legend": {"display": False},
+            },
+            "scales": {
+                "y": {"beginAtZero": True},
+            },
+        },
+    }
+    return quickchart_url(chart)
 
 
 def get_dexscreener_batch_meta(cas_list):
@@ -284,16 +330,312 @@ def get_reputation_penalty(chat_id, caller_id):
     return min(15.0, rejected_calls * 0.5)
 
 
+def get_tracked_chat_ids():
+    settings_ids = settings_collection.distinct("chat_id")
+    call_ids = calls_collection.distinct("chat_id")
+    ids = set(settings_ids or []) | set(call_ids or [])
+    return [chat_id for chat_id in ids if chat_id is not None]
+
+
+def is_win_call(call_doc):
+    initial = float(call_doc.get("initial_mcap", 0) or 0)
+    if initial <= 0:
+        return False
+    ath = float(call_doc.get("ath_mcap", initial) or initial)
+    current = float(call_doc.get("current_mcap", initial) or initial)
+    return (max(ath, current) / initial) >= WIN_MULTIPLIER
+
+
+def is_loss_call(call_doc):
+    initial = float(call_doc.get("initial_mcap", 0) or 0)
+    if initial <= 0:
+        return False
+    current = float(call_doc.get("current_mcap", initial) or initial)
+    return (current / initial) < 1.0
+
+
+def consecutive_count(values):
+    streak = 0
+    for value in values:
+        if value:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _hours_since(dt):
+    if not dt:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (utc_now() - dt).total_seconds() / 3600.0
+
+
+async def user_is_admin(bot, chat_id, user_id):
+    member = await bot.get_chat_member(chat_id, user_id)
+    return member.status in {"administrator", "creator"}
+
+
+def _accepted_query(chat_id, extra=None):
+    query = accepted_call_filter(chat_id)
+    if extra:
+        query = {**query, **extra}
+    return query
+
+
+async def run_streak_scan_for_chat(bot, chat_id, manual=False):
+    setting = settings_collection.find_one({"chat_id": chat_id}) or {}
+    if not manual and not setting.get("alerts", False):
+        return 0
+
+    cutoff = utc_now() - timedelta(hours=ACTIVE_CALL_WINDOW_HOURS)
+    active_calls = list(
+        calls_collection.find(
+            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}, "caller_id": {"$ne": None}})
+        )
+    )
+    if not active_calls:
+        return 0
+
+    active_user_ids = sorted({call.get("caller_id") for call in active_calls if call.get("caller_id") is not None})
+    triggered = 0
+
+    for user_id in active_user_ids:
+        recent_calls = list(
+            calls_collection.find(_accepted_query(chat_id, {"caller_id": user_id}))
+            .sort("timestamp", -1)
+            .limit(STREAK_LOOKBACK)
+        )
+        if not recent_calls:
+            continue
+
+        latest_ts = recent_calls[0].get("timestamp")
+        if latest_ts and latest_ts.tzinfo is None:
+            latest_ts = latest_ts.replace(tzinfo=timezone.utc)
+        if not latest_ts or latest_ts < cutoff:
+            continue
+
+        refresh_calls_market_data(recent_calls)
+        wins = [is_win_call(call) for call in recent_calls]
+        losses = [is_loss_call(call) for call in recent_calls]
+        hot_streak = consecutive_count(wins)
+        cold_streak = consecutive_count(losses)
+
+        profile = user_profiles_collection.find_one({"chat_id": chat_id, "user_id": user_id}) or {}
+        caller_name = recent_calls[0].get("caller_name", profile.get("display_name", f"User {user_id}"))
+        now = utc_now()
+
+        if hot_streak >= HOT_STREAK_MIN:
+            last_hot = profile.get("alerts", {}).get("hot_notified_at")
+            hours_since = _hours_since(last_hot)
+            last_hot_len = int(profile.get("alerts", {}).get("hot_len", 0) or 0)
+            should_send = manual or hours_since is None or hours_since >= ALERT_COOLDOWN_HOURS or hot_streak > last_hot_len
+            if should_send:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🔥 Hot Streak Alert\n"
+                        f"{caller_name} is on a {hot_streak}-call win streak.\n"
+                        f"Recent call was within the last {ACTIVE_CALL_WINDOW_HOURS}h."
+                    ),
+                )
+                user_profiles_collection.update_one(
+                    {"chat_id": chat_id, "user_id": user_id},
+                    {"$set": {"alerts.hot_notified_at": now, "alerts.hot_len": hot_streak}},
+                    upsert=True,
+                )
+                triggered += 1
+
+        if cold_streak >= COLD_STREAK_MIN:
+            last_cold = profile.get("alerts", {}).get("cold_notified_at")
+            hours_since = _hours_since(last_cold)
+            last_cold_len = int(profile.get("alerts", {}).get("cold_len", 0) or 0)
+            should_send = manual or hours_since is None or hours_since >= ALERT_COOLDOWN_HOURS or cold_streak > last_cold_len
+            if should_send:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⚠️ Danger Streak\n"
+                        f"{caller_name} is on a {cold_streak}-call losing streak.\n"
+                        f"Review recent calls before trusting new entries."
+                    ),
+                )
+                user_profiles_collection.update_one(
+                    {"chat_id": chat_id, "user_id": user_id},
+                    {"$set": {"alerts.cold_notified_at": now, "alerts.cold_len": cold_streak}},
+                    upsert=True,
+                )
+                triggered += 1
+
+    return triggered
+
+
+def build_daily_digest(chat_id, since_ts):
+    query = _accepted_query(chat_id, {"timestamp": {"$gte": since_ts}})
+    calls = list(calls_collection.find(query))
+    if not calls:
+        return "📰 Daily Intel Digest\nNo accepted calls in the last 24h."
+
+    refresh_calls_market_data(calls)
+    user_calls = {}
+    for call in calls:
+        user_calls.setdefault(get_caller_key(call), []).append(call)
+
+    ranking = []
+    for _, call_set in user_calls.items():
+        metrics = derive_user_metrics(call_set)
+        if metrics["calls"] == 0:
+            continue
+        ranking.append(
+            {
+                "name": call_set[0].get("caller_name", "Unknown"),
+                "calls": metrics["calls"],
+                "avg_now_x": 1.0 + metrics["avg_now"],
+                "best_x": metrics["best_x"],
+                "win_rate": metrics["win_rate"] * 100,
+            }
+        )
+
+    ranking.sort(key=lambda x: (x["avg_now_x"], x["win_rate"], x["calls"]), reverse=True)
+    top = ranking[:3]
+    worst = sorted(ranking, key=lambda x: (x["avg_now_x"], x["win_rate"]))[:3]
+
+    best_call = max(
+        calls,
+        key=lambda c: (float(c.get("ath_mcap", 0) or 0) / float(c.get("initial_mcap", 1) or 1)),
+        default=None,
+    )
+    worst_rug = min(
+        calls,
+        key=lambda c: (float(c.get("current_mcap", 0) or 0) / float(c.get("initial_mcap", 1) or 1)),
+        default=None,
+    )
+
+    ca_counts = {}
+    for call in calls:
+        ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
+        if not ca_norm:
+            continue
+        item = ca_counts.setdefault(ca_norm, {"count": 0, "symbol": call.get("token_symbol", ""), "ca": call.get("ca", ca_norm)})
+        item["count"] += 1
+    top_mentions = sorted(ca_counts.values(), key=lambda x: x["count"], reverse=True)[:5]
+
+    lines = ["📰 Daily Intel Digest (24h)", ""]
+    lines.append("🏆 Top Callers:")
+    if top:
+        for row in top:
+            lines.append(
+                f"- {row['name']}: Avg {format_return(row['avg_now_x'])}, Win {row['win_rate']:.1f}%, Calls {row['calls']}"
+            )
+    else:
+        lines.append("- None")
+
+    lines.append("")
+    lines.append("🧯 Worst Callers:")
+    if worst:
+        for row in worst:
+            lines.append(
+                f"- {row['name']}: Avg {format_return(row['avg_now_x'])}, Win {row['win_rate']:.1f}%, Calls {row['calls']}"
+            )
+    else:
+        lines.append("- None")
+
+    lines.append("")
+    if best_call:
+        initial = float(best_call.get("initial_mcap", 1) or 1)
+        best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
+        lines.append(f"🔥 Best Call: {format_return(best_x)} by {best_call.get('caller_name', 'Unknown')}")
+    else:
+        lines.append("🔥 Best Call: N/A")
+
+    if worst_rug:
+        initial = float(worst_rug.get("initial_mcap", 1) or 1)
+        now_x = float(worst_rug.get("current_mcap", initial) or initial) / initial
+        lines.append(f"🩸 Worst Rug: {format_return(now_x)} by {worst_rug.get('caller_name', 'Unknown')}")
+    else:
+        lines.append("🩸 Worst Rug: N/A")
+
+    lines.append("")
+    lines.append("📣 Most Mentioned CAs:")
+    if top_mentions:
+        for row in top_mentions:
+            lines.append(f"- {token_label(row['symbol'], row['ca'])}: {row['count']} mentions")
+    else:
+        lines.append("- None")
+
+    return "\n".join(lines)
+
+
+async def send_daily_digest(bot, chat_id, manual=False):
+    setting = settings_collection.find_one({"chat_id": chat_id}) or {}
+    if not manual and not setting.get("alerts", False):
+        return False
+
+    now = utc_now()
+    today = now.strftime("%Y-%m-%d")
+    if not manual:
+        if now.hour < DIGEST_HOUR_UTC:
+            return False
+        if setting.get("last_digest_date") == today:
+            return False
+
+    digest_text = build_daily_digest(chat_id, now - timedelta(hours=24))
+    await bot.send_message(chat_id=chat_id, text=digest_text)
+    settings_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"last_digest_date": today}},
+        upsert=True,
+    )
+    return True
+
+
+async def heartbeat_loop(application: Application):
+    while True:
+        try:
+            chat_ids = get_tracked_chat_ids()
+            for chat_id in chat_ids:
+                try:
+                    await run_streak_scan_for_chat(application.bot, chat_id, manual=False)
+                    await send_daily_digest(application.bot, chat_id, manual=False)
+                except Exception as exc:
+                    print(f"Heartbeat chat error ({chat_id}): {exc}")
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            print(f"Heartbeat loop error: {exc}")
+
+        await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
+async def on_startup(application: Application):
+    application.bot_data["heartbeat_task"] = asyncio.create_task(heartbeat_loop(application))
+
+
+async def on_shutdown(application: Application):
+    task = application.bot_data.get("heartbeat_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 async def toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     setting = settings_collection.find_one({"chat_id": chat_id}) or {}
 
     if not setting.get("alerts", False):
         settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": True}}, upsert=True)
-        await update.effective_message.reply_text("Alerts ON: I will announce every new tracked CA here.")
+        await update.effective_message.reply_text(
+            "Alerts ON: heartbeat streak alerts and daily digest are enabled."
+        )
     else:
         settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": False}}, upsert=True)
-        await update.effective_message.reply_text("Alerts OFF: I will track CAs silently here.")
+        await update.effective_message.reply_text(
+            "Alerts OFF: heartbeat streak alerts and daily digest are disabled."
+        )
 
 
 async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -372,12 +714,6 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             calls_collection.insert_one(call_data)
             update_user_profile(chat_id, user, "accepted")
-
-            setting = settings_collection.find_one({"chat_id": chat_id}) or {}
-            if setting.get("alerts", False):
-                await message_obj.reply_text(
-                    f"New call tracked\nToken: {token_label(symbol, ca_norm)}\nCA: {ca_norm}\nCaller: {user.first_name}\nEntry MCAP: ${mcap:,.2f}"
-                )
 
 
 def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
@@ -575,6 +911,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     recent_calls = all_user_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
+    caller_id = recent_calls[0].get("caller_id")
     win_pct = metrics["win_rate"] * 100
     recent_cas_norm = [c.get("ca_norm", normalize_ca(c.get("ca", ""))) for c in recent_calls if c.get("ca")]
     recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
@@ -609,7 +946,17 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         lines.append("")
 
-    await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
+    reply_markup = None
+    if caller_id is not None:
+        reply_markup = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_caller_{caller_id}")]]
+        )
+
+    await update.effective_message.reply_text(
+        "\n".join(lines),
+        parse_mode="HTML",
+        reply_markup=reply_markup,
+    )
 
 
 async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -696,7 +1043,10 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"{best_by_text}"
     )
 
-    await status_message.edit_text(text, parse_mode="HTML")
+    reply_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("📊 Mini Chart", callback_data="chart_group")]]
+    )
+    await status_message.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,10 +1160,161 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(lines))
 
 
+async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, time_arg: str = "7d"):
+    fake_context = type("obj", (), {"args": [time_arg]})()
+    time_filter, time_text = _resolve_time_filter(fake_context)
+    calls = list(calls_collection.find(_accepted_query(chat_id, time_filter)))
+    if not calls:
+        await context.bot.send_message(chat_id=chat_id, text=f"No data for {time_text} to chart.")
+        return
+
+    refresh_calls_market_data(calls)
+    metrics = derive_user_metrics(calls)
+    chart_url = build_performance_chart_url(
+        f"Group Mini Chart ({time_text})",
+        metrics["win_rate"] * 100.0,
+        metrics["profitable_rate"] * 100.0,
+        1.0 + metrics["avg_now"],
+    )
+    caption = (
+        f"📊 Group Mini Chart ({time_text})\n"
+        f"Win Rate: {metrics['win_rate'] * 100:.1f}%\n"
+        f"Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
+        f"Avg: {format_return(1.0 + metrics['avg_now'])}"
+    )
+    await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
+
+
+async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, caller_id: int):
+    calls = list(
+        calls_collection.find(_accepted_query(chat_id, {"caller_id": caller_id}))
+        .sort("timestamp", -1)
+        .limit(50)
+    )
+    if not calls:
+        await context.bot.send_message(chat_id=chat_id, text="No caller data found for chart.")
+        return
+
+    refresh_calls_market_data(calls)
+    metrics = derive_user_metrics(calls)
+    caller_name = calls[0].get("caller_name", f"User {caller_id}")
+    chart_url = build_performance_chart_url(
+        f"{caller_name} Mini Chart",
+        metrics["win_rate"] * 100.0,
+        metrics["profitable_rate"] * 100.0,
+        1.0 + metrics["avg_now"],
+    )
+    caption = (
+        f"📊 Caller Mini Chart: {caller_name}\n"
+        f"Win Rate: {metrics['win_rate'] * 100:.1f}%\n"
+        f"Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
+        f"Avg: {format_return(1.0 + metrics['avg_now'])} | Best: {format_return(metrics['best_x'])}"
+    )
+    await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
+
+
+def top_caller_id(chat_id: int, lookback_days: int = 7):
+    cutoff = utc_now() - timedelta(days=lookback_days)
+    calls = list(calls_collection.find(_accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})))
+    if not calls:
+        return None
+    user_calls = {}
+    for call in calls:
+        caller_id = call.get("caller_id")
+        if caller_id is None:
+            continue
+        user_calls.setdefault(caller_id, []).append(call)
+    if not user_calls:
+        return None
+    best = None
+    best_score = -10**9
+    for caller_id, call_set in user_calls.items():
+        metrics = derive_user_metrics(call_set)
+        score = (1.0 + metrics["avg_now"]) + (metrics["win_rate"] * 0.5)
+        if metrics["calls"] >= 2 and score > best_score:
+            best = caller_id
+            best_score = score
+    return best
+
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    if not await user_is_admin(context.bot, chat.id, user.id):
+        await update.effective_message.reply_text("Admin only command")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔥 Test Streak Scan", callback_data="admin_streak"),
+                InlineKeyboardButton("📰 Test Daily Digest", callback_data="admin_digest"),
+            ],
+            [
+                InlineKeyboardButton("📊 Group Mini Chart", callback_data="admin_group_chart"),
+                InlineKeyboardButton("🏆 Top Caller Chart", callback_data="admin_top_caller_chart"),
+            ],
+        ]
+    )
+    await update.effective_message.reply_text("Admin Test Panel", reply_markup=keyboard)
+
+
+async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    user_id = query.from_user.id
+
+    if not await user_is_admin(context.bot, chat_id, user_id):
+        await query.message.reply_text("Admin only action")
+        return
+
+    action = query.data
+    if action == "admin_streak":
+        count = await run_streak_scan_for_chat(context.bot, chat_id, manual=True)
+        await query.message.reply_text(f"Streak scan complete. Alerts sent: {count}")
+    elif action == "admin_digest":
+        await send_daily_digest(context.bot, chat_id, manual=True)
+        await query.message.reply_text("Daily digest sent.")
+    elif action == "admin_group_chart":
+        await send_group_mini_chart(context, chat_id, time_arg="7d")
+    elif action == "admin_top_caller_chart":
+        caller_id = top_caller_id(chat_id, lookback_days=7)
+        if caller_id is None:
+            await query.message.reply_text("No top caller found for chart.")
+            return
+        await send_caller_mini_chart(context, chat_id, caller_id)
+
+
+async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    chat_id = query.message.chat_id
+    data = query.data
+
+    if data == "chart_group":
+        await send_group_mini_chart(context, chat_id, time_arg="7d")
+        return
+
+    if data.startswith("chart_caller_"):
+        try:
+            caller_id = int(data.split("_")[-1])
+        except ValueError:
+            await query.message.reply_text("Invalid caller chart request.")
+            return
+        await send_caller_mini_chart(context, chat_id, caller_id)
+
+
 def main():
     ensure_indexes()
 
-    app = Application.builder().token(TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_ca))
     app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT & ~filters.COMMAND, track_ca))
@@ -825,8 +1326,11 @@ def main():
     app.add_handler(CommandHandler("groupstats", group_stats))
     app.add_handler(CommandHandler("myscore", my_score))
     app.add_handler(CommandHandler("adminstats", admin_stats))
+    app.add_handler(CommandHandler("adminpanel", admin_panel))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
+    app.add_handler(CallbackQueryHandler(admin_actions, pattern=r"^admin_"))
+    app.add_handler(CallbackQueryHandler(chart_actions, pattern=r"^chart_"))
 
     print("YabaiRankBot running")
     app.run_polling()
