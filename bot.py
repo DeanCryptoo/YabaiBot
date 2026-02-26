@@ -69,12 +69,6 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
-def pct_bar(pct, width=10):
-    pct = clamp(pct, 0.0, 100.0)
-    filled = int(round((pct / 100.0) * width))
-    return ("█" * filled) + ("░" * (width - filled))
-
-
 def short_ca(ca):
     if not ca:
         return "N/A"
@@ -471,14 +465,13 @@ async def render_leaderboard_page(message_obj, context, page=0):
     end_idx = start_idx + items_per_page
     page_data = data[start_idx:end_idx]
 
-    lines = [f"🏆 {title}", f"Page {page + 1}/{total_pages}", ""]
+    lines = [f"🏆 {title} 🏆", f"Page {page + 1}/{total_pages}", ""]
 
     for idx, row in enumerate(page_data, start=start_idx + 1):
-        win_bar = pct_bar(row["win_rate"], width=8)
         lines.append(
-            f"{idx}. {row['name']}  ({row['calls']} calls)\n"
-            f"   Win {row['win_rate']:.1f}% {win_bar} | Score {row['score']:.1f}\n"
-            f"   Avg {row['avg_now_x']:.2f}x | Best {row['best_x']:.2f}x | Profitable {row['profitable_rate']:.0f}%"
+            f"{idx}. {row['name']} ({row['calls']} calls)\n"
+            f"   📈 Avg: {row['avg_now_x']:.2f}x | 🔥 Best: {row['best_x']:.2f}x\n"
+            f"   🎯 Win Rate: {row['win_rate']:.1f}%"
         )
         lines.append("")
 
@@ -540,19 +533,15 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     recent_calls = all_user_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     win_pct = metrics["win_rate"] * 100
-    score_pct = metrics["reputation"]
-    pnl_now = (metrics["avg_now"]) * 100
 
     lines = [
-        f"📊 Caller: {actual_name}",
-        f"Calls: {metrics['calls']}",
-        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}% {pct_bar(win_pct)}",
-        f"Avg Now: {1 + metrics['avg_now']:.2f}x ({pnl_now:+.1f}%)",
-        f"Best Call: {metrics['best_x']:.2f}x",
-        f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}",
-        f"Reputation: {score_pct:.1f}/100 {pct_bar(score_pct)}",
+        f"👤 Caller Profile: {actual_name}",
+        f"📞 Total Calls: {metrics['calls']}",
+        f"📈 Avg: {1 + metrics['avg_now']:.2f}x | 🔥 Best: {metrics['best_x']:.2f}x",
+        f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%",
+        f"🏅 Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}",
         "",
-        "Recent Calls",
+        "Recent Calls:",
     ]
 
     for call in recent_calls:
@@ -565,7 +554,8 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
         s_ca = short_ca(ca)
         lines.append(
-            f"• {s_ca}  {call_date}  ATH {(ath / initial):.2f}x  Now {(current / initial):.2f}x"
+            f"• {s_ca} ({call_date})\n"
+            f"   📈 ATH: {(ath / initial):.2f}x | 💰 Now: {(current / initial):.2f}x"
         )
 
     await update.effective_message.reply_text("\n".join(lines))
@@ -592,21 +582,16 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     refresh_calls_market_data(user_calls)
     metrics = derive_user_metrics(user_calls)
 
-    profile = user_profiles_collection.find_one({"chat_id": chat_id, "user_id": user.id}) or {}
-    rejected = int(profile.get("rejected_calls", 0) or 0)
     penalty = get_reputation_penalty(chat_id, user.id)
-    effective_reputation = max(0.0, metrics["reputation"] - penalty)
     win_pct = metrics["win_rate"] * 100
-    pnl_now = metrics["avg_now"] * 100
+    score = max(0.0, metrics["reputation"] - penalty)
 
     text = (
-        f"📈 Your Performance\n"
-        f"Calls: {metrics['calls']}\n"
-        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}% {pct_bar(win_pct)}\n"
-        f"Avg Now: {1 + metrics['avg_now']:.2f}x ({pnl_now:+.1f}%)\n"
-        f"Best Call: {metrics['best_x']:.2f}x\n"
-        f"Reputation: {effective_reputation:.1f}/100 {pct_bar(effective_reputation)}\n"
-        f"Rejected attempts: {rejected} | Score penalty: {penalty:.1f}\n"
+        f"📈 Your Performance\n\n"
+        f"📞 Total Calls: {metrics['calls']}\n"
+        f"📈 Avg: {1 + metrics['avg_now']:.2f}x | 🔥 Best: {metrics['best_x']:.2f}x\n"
+        f"🎯 Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}%\n"
+        f"⭐ Score: {score:.1f}/100\n"
         f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
     )
     await update.effective_message.reply_text(text)
@@ -624,7 +609,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     refresh_calls_market_data(all_calls)
 
     total_calls = len(all_calls)
-    unique_callers = set(call.get("caller_id") for call in all_calls if call.get("caller_id") is not None)
+    unique_callers = set(get_caller_key(call) for call in all_calls)
 
     group_metrics = derive_user_metrics(all_calls)
 
@@ -639,15 +624,20 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         initial = float(best_call.get("initial_mcap", 1) or 1)
         best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
         ca = best_call.get("ca", "")
-        best_text = f"{best_x:.2f}x by {best_call.get('caller_name', 'Unknown')} ({short_ca(ca)})"
+        best_caller = best_call.get("caller_name", "Unknown")
+        best_text = f"{best_x:.2f}x"
+        best_by_text = f"   └ By {best_caller} ({short_ca(ca)})"
+    else:
+        best_by_text = "   └ By N/A"
 
     text = (
-        f"📊 Group Overview\n\n"
-        f"Callers: {len(unique_callers)}\n"
-        f"Accepted Calls: {total_calls}\n"
-        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}% {pct_bar(group_metrics['win_rate'] * 100)}\n"
-        f"Avg Now: {1 + group_metrics['avg_now']:.2f}x\n"
-        f"Best Call: {best_text}"
+        f"📊 Group Performance Overview 📊\n\n"
+        f"👥 Total Callers: {len(unique_callers)}\n"
+        f"📞 Total Calls Tracked: {total_calls}\n"
+        f"🎯 Group Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n\n"
+        f"📈 Group Average: {1 + group_metrics['avg_now']:.2f}x\n"
+        f"🔥 Best Call All-Time: {best_text}\n"
+        f"{best_by_text}"
     )
 
     await status_message.edit_text(text)
