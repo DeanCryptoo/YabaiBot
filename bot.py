@@ -324,14 +324,38 @@ def generate_group_stats_card(
     return buffer
 
 
-def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_win_rate, best_win_text):
+def generate_leaderboard_spotlight_card(
+    title,
+    top_name,
+    top_avg,
+    top_best,
+    top_win_rate,
+    highlight_text,
+    highlight_label="Best Win Window",
+    theme="leaderboard",
+):
     width, height = 1200, 440
     card = Image.new("RGB", (width, height), (14, 22, 38))
-    draw_vertical_gradient(card, (12, 28, 46), (23, 54, 78))
+
+    if theme == "danger":
+        draw_vertical_gradient(card, (60, 8, 16), (108, 18, 22))
+        glow_color = (239, 68, 68, 55)
+        panel_fill = (36, 7, 11, 175)
+        panel_outline = (215, 85, 96, 145)
+        stat_color = (255, 142, 142)
+        heading = "WALL OF SHAME SPOTLIGHT"
+    else:
+        draw_vertical_gradient(card, (12, 28, 46), (23, 54, 78))
+        glow_color = (59, 130, 246, 48)
+        panel_fill = (8, 18, 34, 175)
+        panel_outline = (83, 138, 189, 135)
+        stat_color = (141, 255, 113)
+        heading = "LEADERBOARD SPOTLIGHT"
+
     overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     od = ImageDraw.Draw(overlay)
-    od.rounded_rectangle((28, 24, 1172, 416), radius=28, fill=(8, 18, 34, 175), outline=(83, 138, 189, 135), width=2)
-    od.ellipse((760, -90, 1280, 350), fill=(59, 130, 246, 48))
+    od.rounded_rectangle((28, 24, 1172, 416), radius=28, fill=panel_fill, outline=panel_outline, width=2)
+    od.ellipse((760, -90, 1280, 350), fill=glow_color)
     card = Image.alpha_composite(card.convert("RGBA"), overlay).convert("RGB")
     draw = ImageDraw.Draw(card)
 
@@ -347,16 +371,16 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     safe_title = fit_text(draw, title, sub_font, 620)
     safe_name = fit_text(draw, top_name, block_font, 560)
 
-    draw.text((left_x, 54), "LEADERBOARD SPOTLIGHT", font=title_font, fill=(241, 247, 255))
+    draw.text((left_x, 54), heading, font=title_font, fill=(241, 247, 255))
     draw.text((left_x + 2, 112), safe_title, font=sub_font, fill=(161, 203, 235))
 
     draw.text((left_x, 175), f"#1 {safe_name}", font=block_font, fill=(255, 255, 255))
-    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
-    draw.text((left_x, 276), fit_text(draw, f"Best {top_best}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg}", stat_font, 610), font=stat_font, fill=stat_color)
+    draw.text((left_x, 276), fit_text(draw, f"Best {top_best}", stat_font, 610), font=stat_font, fill=stat_color)
     draw.text((left_x, 330), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
 
-    draw.text((right_x, 180), "Best Win Window", font=block_font, fill=(204, 231, 255))
-    lines = wrap_text_lines(draw, ascii_safe(best_win_text, fallback="N/A"), sub_font, right_w, max_lines=4)
+    draw.text((right_x, 180), highlight_label, font=block_font, fill=(204, 231, 255))
+    lines = wrap_text_lines(draw, ascii_safe(highlight_text, fallback="N/A"), sub_font, right_w, max_lines=4)
     y = 228
     for line in lines:
         draw.text((right_x, y), line, font=sub_font, fill=(255, 255, 255))
@@ -1095,36 +1119,43 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
     if is_bottom:
         leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"]))
         title = f"Wall of Shame ({time_text})"
+        worst_row = leaderboard_data[0]
+        highlight_label = "☠️ Worst Avg"
+        highlight_text = f"{format_return(worst_row['avg_now_x'])} by {worst_row['name']}"
     else:
         leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"], x["calls"]), reverse=True)
         title = f"Yabai Callers ({time_text})"
+        highlight_label = "🔥 Best Win"
+        highlight_text = best_win_text
 
     context.chat_data["leaderboard_title"] = title
     context.chat_data["leaderboard_data"] = leaderboard_data
-    context.chat_data["leaderboard_best_win"] = best_win_text
+    context.chat_data["leaderboard_highlight_label"] = highlight_label
+    context.chat_data["leaderboard_highlight_text"] = highlight_text
     context.chat_data["leaderboard_image_mode"] = False
 
-    if not is_bottom:
-        try:
-            top = leaderboard_data[0]
-            spotlight = generate_leaderboard_spotlight_card(
-                title=ascii_safe(title, fallback="Yabai Leaderboard"),
-                top_name=ascii_safe(top["name"], fallback="Top Caller"),
-                top_avg=ascii_safe(format_return(top["avg_now_x"]), fallback="N/A"),
-                top_best=ascii_safe(format_return(top["best_x"]), fallback="N/A"),
-                top_win_rate=top["win_rate"],
-                best_win_text=ascii_safe(best_win_text, fallback="N/A"),
-            )
-            context.chat_data["leaderboard_image_mode"] = True
-            caption_text, reply_markup = build_leaderboard_page(context, page=0)
-            await update.effective_message.reply_photo(
-                photo=spotlight,
-                caption=caption_text,
-                reply_markup=reply_markup,
-            )
-            return
-        except Exception:
-            context.chat_data["leaderboard_image_mode"] = False
+    try:
+        top = leaderboard_data[0]
+        spotlight = generate_leaderboard_spotlight_card(
+            title=ascii_safe(title, fallback="Yabai Leaderboard"),
+            top_name=ascii_safe(top["name"], fallback="Top Caller"),
+            top_avg=ascii_safe(format_return(top["avg_now_x"]), fallback="N/A"),
+            top_best=ascii_safe(format_return(top["best_x"]), fallback="N/A"),
+            top_win_rate=top["win_rate"],
+            highlight_text=ascii_safe(highlight_text, fallback="N/A"),
+            highlight_label=ascii_safe(highlight_label, fallback="Highlight"),
+            theme="danger" if is_bottom else "leaderboard",
+        )
+        context.chat_data["leaderboard_image_mode"] = True
+        caption_text, reply_markup = build_leaderboard_page(context, page=0)
+        await update.effective_message.reply_photo(
+            photo=spotlight,
+            caption=caption_text,
+            reply_markup=reply_markup,
+        )
+        return
+    except Exception:
+        context.chat_data["leaderboard_image_mode"] = False
 
     text, reply_markup = build_leaderboard_page(context, page=0)
     await update.effective_message.reply_text(text, reply_markup=reply_markup)
@@ -1141,7 +1172,8 @@ async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def build_leaderboard_page(context, page=0):
     data = context.chat_data.get("leaderboard_data", [])
     title = context.chat_data.get("leaderboard_title", "Leaderboard")
-    best_win_text = context.chat_data.get("leaderboard_best_win", "N/A")
+    highlight_label = context.chat_data.get("leaderboard_highlight_label", "🔥 Best Win")
+    highlight_text = context.chat_data.get("leaderboard_highlight_text", "N/A")
     image_mode = bool(context.chat_data.get("leaderboard_image_mode", False))
     items_per_page = 6 if image_mode else 10
     total_pages = max(1, math.ceil(len(data) / items_per_page))
@@ -1153,7 +1185,7 @@ def build_leaderboard_page(context, page=0):
     lines = [
         f"🏆 {title.upper()}",
         f"📄 Page {page + 1}/{total_pages}",
-        f"🔥 Best Win: {best_win_text}",
+        f"{highlight_label}: {highlight_text}",
         "────────────────",
     ]
 
@@ -1161,9 +1193,10 @@ def build_leaderboard_page(context, page=0):
         badge = rank_badge(idx)
         stars = stars_from_rank(idx)
         star_block = f" {stars}" if stars else ""
+        trend_emoji = "📉" if row["avg_now_x"] < 1 else "📈"
         lines.append(
             f"{badge} {row['name']}{star_block}\n"
-            f"↳ 📈 Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
+            f"↳ {trend_emoji} Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
             f"↳ 🎯 Win: {row['win_rate']:.1f}% | 📞 Calls: {row['calls']}"
         )
         lines.append("────────────────")
