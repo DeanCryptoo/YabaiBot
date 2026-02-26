@@ -370,6 +370,90 @@ def generate_myscore_card(
     return buffer
 
 
+def build_circle_avatar(image, diameter):
+    if image is None:
+        return None
+    img = image.convert("RGB")
+    width, height = img.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    try:
+        resample = Image.Resampling.LANCZOS
+    except AttributeError:
+        resample = Image.LANCZOS
+    img = img.resize((diameter, diameter), resample=resample)
+
+    mask = Image.new("L", (diameter, diameter), 0)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.ellipse((0, 0, diameter - 1, diameter - 1), fill=255)
+
+    avatar_rgba = Image.new("RGBA", (diameter, diameter), (0, 0, 0, 0))
+    avatar_rgba.paste(img, (0, 0))
+    avatar_rgba.putalpha(mask)
+    return avatar_rgba
+
+
+def generate_caller_profile_card(
+    display_name,
+    stars,
+    calls,
+    avg_text,
+    best_text,
+    hit_rate_pct,
+    score_value,
+    rug_text,
+    badges_text,
+    avatar_image=None,
+):
+    width, height = 1200, 440
+    card = Image.new("RGB", (width, height), (14, 22, 38))
+    draw_vertical_gradient(card, (12, 28, 46), (23, 54, 78))
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    od.rounded_rectangle((28, 24, 1172, 416), radius=28, fill=(8, 18, 34, 175), outline=(83, 138, 189, 135), width=2)
+    od.ellipse((760, -90, 1280, 350), fill=(59, 130, 246, 48))
+    card = Image.alpha_composite(card.convert("RGBA"), overlay).convert("RGB")
+    draw = ImageDraw.Draw(card)
+
+    title_font = load_font(46, bold=True)
+    block_font = load_font(30, bold=True)
+    stat_font = load_font(42, bold=True)
+    sub_font = load_font(26, bold=False)
+
+    left_x = 60
+    right_x = 760
+    right_w = 350
+
+    safe_name = fit_text(draw, ascii_safe(display_name, fallback="Caller"), block_font, 620)
+    safe_stars = ascii_safe(stars, fallback="")
+
+    draw.text((left_x, 54), "CALLER PROFILE", font=title_font, fill=(241, 247, 255))
+    draw.text((left_x + 2, 112), f"{safe_name} {safe_stars}".strip(), font=sub_font, fill=(161, 203, 235))
+    draw.text((left_x, 175), fit_text(draw, f"Calls {calls}", block_font, 620), font=block_font, fill=(255, 255, 255))
+    draw.text((left_x, 228), fit_text(draw, f"Avg {avg_text}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 276), fit_text(draw, f"Best {best_text}", stat_font, 610), font=stat_font, fill=(141, 255, 113))
+    draw.text((left_x, 330), fit_text(draw, f"Hit Rate {hit_rate_pct:.1f}%", block_font, 620), font=block_font, fill=(217, 236, 255))
+
+    draw.text((right_x, 168), "Score", font=block_font, fill=(204, 231, 255))
+    draw.text((right_x, 214), fit_text(draw, f"{score_value:.1f}/100", stat_font, right_w), font=stat_font, fill=(255, 255, 255))
+    draw.text((right_x, 264), fit_text(draw, rug_text, block_font, right_w), font=block_font, fill=(217, 236, 255))
+    draw.text((right_x, 308), fit_text(draw, f"Badges: {badges_text}", sub_font, right_w), font=sub_font, fill=(217, 236, 255))
+
+    avatar = build_circle_avatar(avatar_image, 118) if avatar_image is not None else None
+    if avatar is not None:
+        card_rgba = card.convert("RGBA")
+        card_rgba.alpha_composite(avatar, (right_x + right_w - 118, 44))
+        card = card_rgba.convert("RGB")
+
+    buffer = BytesIO()
+    card.save(buffer, format="PNG", optimize=True)
+    buffer.seek(0)
+    return buffer
+
+
 def generate_leaderboard_spotlight_card(
     title,
     top_name,
@@ -1460,19 +1544,40 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     caption = "\n".join(lines)
-    if caller_id is not None and len(caption) <= 1000:
+    avatar_image = None
+    if caller_id is not None:
         try:
             photos = await context.bot.get_user_profile_photos(user_id=caller_id, limit=1)
             if photos and photos.total_count > 0 and photos.photos and photos.photos[0]:
-                await update.effective_message.reply_photo(
-                    photo=photos.photos[0][-1].file_id,
-                    caption=caption,
-                    parse_mode="HTML",
-                    reply_markup=reply_markup,
-                )
-                return
+                file_obj = await context.bot.get_file(photos.photos[0][-1].file_id)
+                data = await file_obj.download_as_bytearray()
+                avatar_image = Image.open(BytesIO(data)).convert("RGB")
         except Exception:
-            pass
+            avatar_image = None
+
+    try:
+        card = generate_caller_profile_card(
+            display_name=actual_name,
+            stars=stars,
+            calls=metrics["calls"],
+            avg_text=avg_text,
+            best_text=best_text,
+            hit_rate_pct=win_pct,
+            score_value=caller_score,
+            rug_text=f"Rug {rug['rug_count']}/{rug['total']}",
+            badges_text=", ".join(metrics["badges"]) if metrics["badges"] else "None",
+            avatar_image=avatar_image,
+        )
+        caption_text = caption if len(caption) <= 1024 else (caption[:1021] + "...")
+        await update.effective_message.reply_photo(
+            photo=card,
+            caption=caption_text,
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return
+    except Exception:
+        pass
 
     await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=reply_markup)
 
