@@ -2,3 +2,4 @@ python-telegram-bot>=21.0
 pymongo==4.6.1
 requests==2.31.0
 certifi==2024.2.2
+Pillow>=10.0.0
