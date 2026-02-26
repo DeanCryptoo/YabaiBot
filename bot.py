@@ -69,6 +69,20 @@ def clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def pct_bar(pct, width=10):
+    pct = clamp(pct, 0.0, 100.0)
+    filled = int(round((pct / 100.0) * width))
+    return ("█" * filled) + ("░" * (width - filled))
+
+
+def short_ca(ca):
+    if not ca:
+        return "N/A"
+    if len(ca) <= 12:
+        return ca
+    return f"{ca[:6]}...{ca[-4:]}"
+
+
 def get_dexscreener_batch(cas_list):
     results = {}
     if not cas_list:
@@ -128,7 +142,7 @@ def derive_user_metrics(calls):
     returns_now = []
     returns_ath = []
     wins = 0
-    drawdowns = []
+    profitable_now = 0
     best_x = 0.0
 
     for call in calls:
@@ -142,15 +156,15 @@ def derive_user_metrics(calls):
         x_ath = ath / initial
         ret_now = x_now - 1.0
         ret_ath = x_ath - 1.0
-        dd = (ath - current) / ath if ath > 0 else 0.0
 
         returns_now.append(ret_now)
         returns_ath.append(ret_ath)
-        drawdowns.append(dd)
         best_x = max(best_x, x_ath)
 
         if x_ath >= WIN_MULTIPLIER:
             wins += 1
+        if x_now > 1.0:
+            profitable_now += 1
 
     n = len(returns_now)
     if n == 0:
@@ -159,82 +173,49 @@ def derive_user_metrics(calls):
             "avg_now": 0.0,
             "avg_ath": 0.0,
             "win_rate": 0.0,
-            "sharpe": 0.0,
-            "max_drawdown": 0.0,
-            "consistency": 0.0,
-            "risk_adjusted_return": 0.0,
+            "profitable_rate": 0.0,
             "reputation": 0.0,
             "best_x": 0.0,
             "badges": [],
-            "level": "Bronze",
         }
 
     avg_now = sum(returns_now) / n
     avg_ath = sum(returns_ath) / n
     win_rate = wins / n
-
-    if n > 1:
-        mean = avg_now
-        variance = sum((r - mean) ** 2 for r in returns_now) / (n - 1)
-        std = math.sqrt(max(variance, 0))
-    else:
-        std = 0.0
-
-    sharpe = (avg_now / std) * math.sqrt(n) if std > 0 else (2.0 if avg_now > 0 else 0.0)
-    max_drawdown = max(drawdowns) if drawdowns else 0.0
-
-    cv = std / (abs(avg_now) + 1e-9)
-    consistency = clamp(1.0 - min(cv, 2.0) / 2.0, 0.0, 1.0)
-
-    risk_adjusted_return = avg_now * (1.0 - max_drawdown)
-
-    profitability = clamp((avg_ath + 1.0) / 2.0, 0.0, 1.0)
-    sharpe_norm = clamp((sharpe + 1.0) / 3.0, 0.0, 1.0)
+    profitable_rate = profitable_now / n
+    profitability = clamp((avg_now + 1.0) / 2.0, 0.0, 1.0)
+    upside_norm = clamp((avg_ath + 1.0) / 3.0, 0.0, 1.0)
     sample_conf = clamp(math.log1p(n) / math.log(25), 0.0, 1.0)
 
     reputation = 100.0 * (
-        0.30 * win_rate
-        + 0.25 * profitability
-        + 0.20 * sharpe_norm
-        + 0.15 * consistency
+        0.40 * win_rate
+        + 0.30 * profitability
+        + 0.20 * upside_norm
         + 0.10 * sample_conf
     )
     reputation = clamp(reputation, 0.0, 100.0)
 
-    if reputation >= 85:
-        level = "Diamond"
-    elif reputation >= 70:
-        level = "Platinum"
-    elif reputation >= 55:
-        level = "Gold"
-    elif reputation >= 40:
-        level = "Silver"
-    else:
-        level = "Bronze"
-
     badges = []
-    if best_x >= 5.0:
+    if best_x >= 100.0:
+        badges.append("100x Legend")
+    elif best_x >= 25.0:
+        badges.append("Moonshot")
+    elif best_x >= 10.0:
         badges.append("Sniper")
     if n >= 10 and win_rate >= 0.60:
-        badges.append("Consistent")
-    if n >= 50:
-        badges.append("Veteran")
-    if n >= 10 and max_drawdown <= 0.35:
-        badges.append("Risk Manager")
+        badges.append("High Hit Rate")
+    if n >= 5 and avg_now > 0:
+        badges.append("Profitable")
 
     return {
         "calls": n,
         "avg_now": avg_now,
         "avg_ath": avg_ath,
         "win_rate": win_rate,
-        "sharpe": sharpe,
-        "max_drawdown": max_drawdown,
-        "consistency": consistency,
-        "risk_adjusted_return": risk_adjusted_return,
+        "profitable_rate": profitable_rate,
         "reputation": reputation,
         "best_x": best_x,
         "badges": badges,
-        "level": level,
     }
 
 
@@ -443,10 +424,8 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
                 "avg_now_x": 1.0 + metrics["avg_now"],
                 "best_x": metrics["best_x"],
                 "win_rate": metrics["win_rate"] * 100,
-                "sharpe": metrics["sharpe"],
-                "mdd": metrics["max_drawdown"] * 100,
+                "profitable_rate": metrics["profitable_rate"] * 100,
                 "score": score,
-                "level": metrics["level"],
             }
         )
 
@@ -492,18 +471,14 @@ async def render_leaderboard_page(message_obj, context, page=0):
     end_idx = start_idx + items_per_page
     page_data = data[start_idx:end_idx]
 
-    lines = [
-        f"{title}",
-        f"Min {MIN_CALLS_REQUIRED} calls to rank",
-        f"Page {page + 1} of {total_pages}",
-        "",
-    ]
+    lines = [f"🏆 {title}", f"Page {page + 1}/{total_pages}", ""]
 
     for idx, row in enumerate(page_data, start=start_idx + 1):
+        win_bar = pct_bar(row["win_rate"], width=8)
         lines.append(
-            f"{idx}. {row['name']} [{row['level']}] ({row['calls']} calls)\n"
-            f"   Score {row['score']:.1f} | Win {row['win_rate']:.1f}% | Sharpe {row['sharpe']:.2f}\n"
-            f"   AvgATH {row['avg_ath_x']:.2f}x | AvgNow {row['avg_now_x']:.2f}x | Best {row['best_x']:.2f}x | MDD {row['mdd']:.1f}%"
+            f"{idx}. {row['name']}  ({row['calls']} calls)\n"
+            f"   Win {row['win_rate']:.1f}% {win_bar} | Score {row['score']:.1f}\n"
+            f"   Avg {row['avg_now_x']:.2f}x | Best {row['best_x']:.2f}x | Profitable {row['profitable_rate']:.0f}%"
         )
         lines.append("")
 
@@ -564,16 +539,20 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     recent_calls = all_user_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
+    win_pct = metrics["win_rate"] * 100
+    score_pct = metrics["reputation"]
+    pnl_now = (metrics["avg_now"]) * 100
 
     lines = [
-        f"Profile: {actual_name}",
-        f"Calls: {metrics['calls']} | Level: {metrics['level']} | Reputation: {metrics['reputation']:.1f}",
-        f"Win Rate (>={WIN_MULTIPLIER:.1f}x): {metrics['win_rate'] * 100:.1f}%",
-        f"Sharpe: {metrics['sharpe']:.2f} | Max Drawdown: {metrics['max_drawdown'] * 100:.1f}%",
-        f"Risk-Adjusted Return: {metrics['risk_adjusted_return'] * 100:.1f}%",
+        f"📊 Caller: {actual_name}",
+        f"Calls: {metrics['calls']}",
+        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}% {pct_bar(win_pct)}",
+        f"Avg Now: {1 + metrics['avg_now']:.2f}x ({pnl_now:+.1f}%)",
+        f"Best Call: {metrics['best_x']:.2f}x",
         f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}",
+        f"Reputation: {score_pct:.1f}/100 {pct_bar(score_pct)}",
         "",
-        "Recent calls:",
+        "Recent Calls",
     ]
 
     for call in recent_calls:
@@ -584,9 +563,9 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if initial <= 0:
             continue
         call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
-        short_ca = f"{ca[:6]}...{ca[-4:]}" if len(ca) > 10 else ca
+        s_ca = short_ca(ca)
         lines.append(
-            f"- {short_ca} ({call_date}) Entry ${initial:,.0f} | ATH {(ath / initial):.2f}x | Now {(current / initial):.2f}x"
+            f"• {s_ca}  {call_date}  ATH {(ath / initial):.2f}x  Now {(current / initial):.2f}x"
         )
 
     await update.effective_message.reply_text("\n".join(lines))
@@ -617,14 +596,17 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rejected = int(profile.get("rejected_calls", 0) or 0)
     penalty = get_reputation_penalty(chat_id, user.id)
     effective_reputation = max(0.0, metrics["reputation"] - penalty)
+    win_pct = metrics["win_rate"] * 100
+    pnl_now = metrics["avg_now"] * 100
 
     text = (
-        f"Your score\n"
-        f"Calls: {metrics['calls']} | Level: {metrics['level']} | Reputation: {effective_reputation:.1f}\n"
-        f"Win Rate (>={WIN_MULTIPLIER:.1f}x): {metrics['win_rate'] * 100:.1f}%\n"
-        f"Avg ATH: {1 + metrics['avg_ath']:.2f}x | Avg Now: {1 + metrics['avg_now']:.2f}x\n"
-        f"Sharpe: {metrics['sharpe']:.2f} | MDD: {metrics['max_drawdown'] * 100:.1f}%\n"
-        f"Consistency: {metrics['consistency'] * 100:.1f}% | Rejected attempts: {rejected} | Penalty: {penalty:.1f}\n"
+        f"📈 Your Performance\n"
+        f"Calls: {metrics['calls']}\n"
+        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {win_pct:.1f}% {pct_bar(win_pct)}\n"
+        f"Avg Now: {1 + metrics['avg_now']:.2f}x ({pnl_now:+.1f}%)\n"
+        f"Best Call: {metrics['best_x']:.2f}x\n"
+        f"Reputation: {effective_reputation:.1f}/100 {pct_bar(effective_reputation)}\n"
+        f"Rejected attempts: {rejected} | Score penalty: {penalty:.1f}\n"
         f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
     )
     await update.effective_message.reply_text(text)
@@ -657,18 +639,15 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         initial = float(best_call.get("initial_mcap", 1) or 1)
         best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
         ca = best_call.get("ca", "")
-        short_ca = f"{ca[:6]}...{ca[-4:]}" if len(ca) > 10 else ca
-        best_text = f"{best_x:.2f}x by {best_call.get('caller_name', 'Unknown')} ({short_ca})"
+        best_text = f"{best_x:.2f}x by {best_call.get('caller_name', 'Unknown')} ({short_ca(ca)})"
 
     text = (
-        f"Group performance overview\n\n"
-        f"Total callers: {len(unique_callers)}\n"
-        f"Total accepted calls: {total_calls}\n"
-        f"Group win rate (>={WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n"
-        f"Group avg ATH: {1 + group_metrics['avg_ath']:.2f}x\n"
-        f"Group avg Now: {1 + group_metrics['avg_now']:.2f}x\n"
-        f"Group Sharpe: {group_metrics['sharpe']:.2f}\n"
-        f"Best call all-time: {best_text}"
+        f"📊 Group Overview\n\n"
+        f"Callers: {len(unique_callers)}\n"
+        f"Accepted Calls: {total_calls}\n"
+        f"Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}% {pct_bar(group_metrics['win_rate'] * 100)}\n"
+        f"Avg Now: {1 + group_metrics['avg_now']:.2f}x\n"
+        f"Best Call: {best_text}"
     )
 
     await status_message.edit_text(text)
@@ -777,14 +756,34 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_delay = delay_stats[0]["avg_delay"] if delay_stats else 0
     max_delay = delay_stats[0]["max_delay"] if delay_stats else 0
 
+    recent_calls = list(calls_collection.find({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]}))
+    user_calls = {}
+    for call in recent_calls:
+        key = get_caller_key(call)
+        user_calls.setdefault(key, []).append(call)
+
+    low_performers = []
+    for _, user_call_set in user_calls.items():
+        m = derive_user_metrics(user_call_set)
+        if m["calls"] < 3:
+            continue
+        low_performers.append(
+            {
+                "name": user_call_set[0].get("caller_name", "Unknown"),
+                "calls": m["calls"],
+                "win_rate": m["win_rate"] * 100,
+                "avg_now_x": 1 + m["avg_now"],
+            }
+        )
+    low_performers.sort(key=lambda x: (x["win_rate"], x["avg_now_x"]))
+
     lines = [
-        "Admin analytics",
-        f"Accepted calls: {accepted}",
-        f"Rejected attempts: {rejected}",
-        f"Acceptance ratio: {(accepted / (accepted + rejected) * 100) if (accepted + rejected) else 0:.1f}%",
-        f"Ingest delay avg/max: {avg_delay:.1f}s / {max_delay:.0f}s",
+        "🛡️ Admin Panel",
+        f"Accepted: {accepted} | Rejected: {rejected}",
+        f"Acceptance: {(accepted / (accepted + rejected) * 100) if (accepted + rejected) else 0:.1f}%",
+        f"Delay avg/max: {avg_delay:.1f}s / {max_delay:.0f}s",
         "",
-        "Top reject reasons:",
+        "Reject Reasons",
     ]
 
     if reason_counts:
@@ -794,13 +793,24 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("- None")
 
     lines.append("")
-    lines.append("Most suspicious users:")
+    lines.append("Spam Watchlist")
     if suspicious:
         for row in suspicious:
             name = row.get("display_name", "Unknown")
             rej = row.get("rejected_calls", 0)
             acc = row.get("accepted_calls", 0)
-            lines.append(f"- {name}: rejected {rej}, accepted {acc}")
+            if rej > 0:
+                lines.append(f"- {name}: rejected {rej}, accepted {acc}")
+    else:
+        lines.append("- None")
+
+    lines.append("")
+    lines.append("Low Performers (>=3 calls)")
+    if low_performers:
+        for row in low_performers[:5]:
+            lines.append(
+                f"- {row['name']}: win {row['win_rate']:.1f}%, avg {row['avg_now_x']:.2f}x, calls {row['calls']}"
+            )
     else:
         lines.append("- None")
 
