@@ -957,12 +957,14 @@ async def send_daily_digest(bot, chat_id, manual=False):
 
     if digest_data["has_calls"]:
         digest_card = generate_daily_digest_card(digest_data)
+        digest_caption = digest_text if len(digest_text) <= 1024 else (digest_text[:1021] + "...")
         await bot.send_photo(
             chat_id=chat_id,
             photo=digest_card,
-            caption="📰 Daily Snapshot (24h)",
+            caption=digest_caption,
         )
-    await bot.send_message(chat_id=chat_id, text=digest_text)
+    else:
+        await bot.send_message(chat_id=chat_id, text=digest_text)
     settings_collection.update_one(
         {"chat_id": chat_id},
         {"$set": {"last_digest_date": today}},
