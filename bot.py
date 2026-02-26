@@ -1,377 +1,835 @@
 import os
 import re
+import math
 import requests
 import certifi
-import math
 from datetime import datetime, timedelta, timezone
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING, DESCENDING
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, MessageHandler, CommandHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    MessageHandler,
+    CommandHandler,
+    CallbackQueryHandler,
+    filters,
+    ContextTypes,
+)
 
 # --- CONFIGURATION ---
 TOKEN = os.getenv("TELEGRAM_TOKEN")
 MONGO_URI = os.getenv("MONGO_URI")
 
-WIN_MULTIPLIER = 2.0 
-MIN_CALLS_REQUIRED = 1 # Everyone gets ranked immediately.
+WIN_MULTIPLIER = 2.0
+MIN_CALLS_REQUIRED = 1
+MAX_CALL_DELAY_SECONDS = 120
 
 if not TOKEN or not MONGO_URI:
-    raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables!")
+    raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
 
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-db = client['yabai_crypto_bot']
-calls_collection = db['token_calls']
-settings_collection = db['group_settings'] 
+db = client["yabai_crypto_bot"]
 
-CA_REGEX = r'\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b'
+calls_collection = db["token_calls"]
+settings_collection = db["group_settings"]
+user_profiles_collection = db["user_profiles"]
+
+CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
+
+
+def ensure_indexes():
+    calls_collection.create_index([
+        ("chat_id", ASCENDING),
+        ("ca_norm", ASCENDING),
+        ("status", ASCENDING),
+    ])
+    calls_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_collection.create_index([("message_id", ASCENDING), ("chat_id", ASCENDING)])
+
+    user_profiles_collection.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    settings_collection.create_index([("chat_id", ASCENDING)], unique=True)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def normalize_ca(ca: str) -> str:
+    return ca.strip().lower()
+
+
+def accepted_call_filter(chat_id: int):
+    return {
+        "chat_id": chat_id,
+        "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+    }
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
 
 def get_dexscreener_batch(cas_list):
     results = {}
+    if not cas_list:
+        return results
+
     for i in range(0, len(cas_list), 30):
-        chunk = cas_list[i:i+30]
+        chunk = cas_list[i:i + 30]
         url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
         try:
-            response = requests.get(url, timeout=10).json()
-            if response and response.get('pairs'):
-                for pair in response['pairs']:
-                    address = pair.get('baseToken', {}).get('address')
-                    fdv = pair.get('fdv', 0)
-                    if address and fdv > 0:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            payload = response.json()
+            if payload and payload.get("pairs"):
+                for pair in payload["pairs"]:
+                    address = pair.get("baseToken", {}).get("address")
+                    fdv = pair.get("fdv", 0)
+                    if address and fdv and fdv > 0:
                         addr_lower = address.lower()
                         if addr_lower not in results or fdv > results[addr_lower]:
-                            results[addr_lower] = fdv
-        except Exception as e:
-            print(f"Batch fetch error: {e}")
+                            results[addr_lower] = float(fdv)
+        except Exception as exc:
+            print(f"DexScreener batch fetch error: {exc}")
     return results
 
+
+def update_user_profile(chat_id, user, event_type, reason=None):
+    update_doc = {
+        "$setOnInsert": {
+            "chat_id": chat_id,
+            "user_id": user.id,
+            "first_seen": utc_now(),
+        },
+        "$set": {
+            "display_name": user.full_name or user.first_name or "Unknown",
+            "username": user.username,
+            "updated_at": utc_now(),
+        },
+    }
+
+    if event_type == "accepted":
+        update_doc.setdefault("$inc", {})["accepted_calls"] = 1
+        update_doc["$set"]["last_accepted_at"] = utc_now()
+    elif event_type == "rejected":
+        update_doc.setdefault("$inc", {})["rejected_calls"] = 1
+        if reason:
+            field = f"reject_reasons.{reason}"
+            update_doc.setdefault("$inc", {})[field] = 1
+
+    user_profiles_collection.update_one(
+        {"chat_id": chat_id, "user_id": user.id},
+        update_doc,
+        upsert=True,
+    )
+
+
+def derive_user_metrics(calls):
+    returns_now = []
+    returns_ath = []
+    wins = 0
+    drawdowns = []
+    best_x = 0.0
+
+    for call in calls:
+        initial = float(call.get("initial_mcap", 0) or 0)
+        current = float(call.get("current_mcap", initial) or initial)
+        ath = float(max(call.get("ath_mcap", initial) or initial, current))
+        if initial <= 0:
+            continue
+
+        x_now = current / initial
+        x_ath = ath / initial
+        ret_now = x_now - 1.0
+        ret_ath = x_ath - 1.0
+        dd = (ath - current) / ath if ath > 0 else 0.0
+
+        returns_now.append(ret_now)
+        returns_ath.append(ret_ath)
+        drawdowns.append(dd)
+        best_x = max(best_x, x_ath)
+
+        if x_ath >= WIN_MULTIPLIER:
+            wins += 1
+
+    n = len(returns_now)
+    if n == 0:
+        return {
+            "calls": 0,
+            "avg_now": 0.0,
+            "avg_ath": 0.0,
+            "win_rate": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "consistency": 0.0,
+            "risk_adjusted_return": 0.0,
+            "reputation": 0.0,
+            "best_x": 0.0,
+            "badges": [],
+            "level": "Bronze",
+        }
+
+    avg_now = sum(returns_now) / n
+    avg_ath = sum(returns_ath) / n
+    win_rate = wins / n
+
+    if n > 1:
+        mean = avg_now
+        variance = sum((r - mean) ** 2 for r in returns_now) / (n - 1)
+        std = math.sqrt(max(variance, 0))
+    else:
+        std = 0.0
+
+    sharpe = (avg_now / std) * math.sqrt(n) if std > 0 else (2.0 if avg_now > 0 else 0.0)
+    max_drawdown = max(drawdowns) if drawdowns else 0.0
+
+    cv = std / (abs(avg_now) + 1e-9)
+    consistency = clamp(1.0 - min(cv, 2.0) / 2.0, 0.0, 1.0)
+
+    risk_adjusted_return = avg_now * (1.0 - max_drawdown)
+
+    profitability = clamp((avg_ath + 1.0) / 2.0, 0.0, 1.0)
+    sharpe_norm = clamp((sharpe + 1.0) / 3.0, 0.0, 1.0)
+    sample_conf = clamp(math.log1p(n) / math.log(25), 0.0, 1.0)
+
+    reputation = 100.0 * (
+        0.30 * win_rate
+        + 0.25 * profitability
+        + 0.20 * sharpe_norm
+        + 0.15 * consistency
+        + 0.10 * sample_conf
+    )
+    reputation = clamp(reputation, 0.0, 100.0)
+
+    if reputation >= 85:
+        level = "Diamond"
+    elif reputation >= 70:
+        level = "Platinum"
+    elif reputation >= 55:
+        level = "Gold"
+    elif reputation >= 40:
+        level = "Silver"
+    else:
+        level = "Bronze"
+
+    badges = []
+    if best_x >= 5.0:
+        badges.append("Sniper")
+    if n >= 10 and win_rate >= 0.60:
+        badges.append("Consistent")
+    if n >= 50:
+        badges.append("Veteran")
+    if n >= 10 and max_drawdown <= 0.35:
+        badges.append("Risk Manager")
+
+    return {
+        "calls": n,
+        "avg_now": avg_now,
+        "avg_ath": avg_ath,
+        "win_rate": win_rate,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown,
+        "consistency": consistency,
+        "risk_adjusted_return": risk_adjusted_return,
+        "reputation": reputation,
+        "best_x": best_x,
+        "badges": badges,
+        "level": level,
+    }
+
+
+def call_is_duplicate(chat_id, ca_norm):
+    existing = calls_collection.find_one(
+        {
+            "chat_id": chat_id,
+            "ca_norm": ca_norm,
+            "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+        },
+        {"_id": 1},
+    )
+    return existing is not None
+
+
+def get_caller_key(call_doc):
+    caller_id = call_doc.get("caller_id")
+    if caller_id is not None:
+        return f"id:{caller_id}"
+    legacy_name = (call_doc.get("caller_name") or "unknown").strip().lower()
+    return f"legacy:{legacy_name}"
+
+
+def get_reputation_penalty(chat_id, caller_id):
+    if caller_id is None:
+        return 0.0
+    profile = user_profiles_collection.find_one(
+        {"chat_id": chat_id, "user_id": caller_id},
+        {"rejected_calls": 1},
+    ) or {}
+    rejected_calls = int(profile.get("rejected_calls", 0) or 0)
+    return min(15.0, rejected_calls * 0.5)
+
+
 async def toggle_alerts(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
+    chat_id = update.effective_chat.id
     setting = settings_collection.find_one({"chat_id": chat_id}) or {}
-    
-    # Alerts are now OFF (False) by default.
+
     if not setting.get("alerts", False):
         settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": True}}, upsert=True)
-        await update.message.reply_text("🔔 **Alerts ON**: I will announce every new tracked CA here.", parse_mode='Markdown')
+        await update.effective_message.reply_text("Alerts ON: I will announce every new tracked CA here.")
     else:
         settings_collection.update_one({"chat_id": chat_id}, {"$set": {"alerts": False}}, upsert=True)
-        await update.message.reply_text("🔕 **Alerts OFF**: I will track CAs silently here.", parse_mode='Markdown')
+        await update.effective_message.reply_text("Alerts OFF: I will track CAs silently here.")
+
 
 async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message.text
-    user = update.message.from_user
-    chat_id = update.message.chat_id
-    
-    found_cas = set(re.findall(CA_REGEX, message))
-    
-    for ca in found_cas:
-        existing_call = calls_collection.find_one({"ca": ca, "chat_id": chat_id})
-        
-        # If the CA is already in the database for this chat, completely ignore it silently.
-        # This protects the original caller AND prevents duplicate entries if they repost it.
-        if existing_call:
-            continue 
-        
-        batch_data = get_dexscreener_batch([ca])
-        mcap = batch_data.get(ca.lower())
-        
+    message_obj = update.effective_message
+    if not message_obj or not message_obj.text:
+        return
+
+    text = message_obj.text
+    user = update.effective_user
+    chat_id = update.effective_chat.id
+
+    found_cas = {normalize_ca(ca) for ca in re.findall(CA_REGEX, text)}
+    if not found_cas:
+        return
+
+    is_edited = update.edited_message is not None
+
+    msg_time = message_obj.date
+    now = utc_now()
+    if msg_time.tzinfo is None:
+        msg_time = msg_time.replace(tzinfo=timezone.utc)
+    delay_seconds = max(0, int((now - msg_time).total_seconds()))
+
+    for ca_norm in found_cas:
+        rejection_reason = None
+
+        if is_edited:
+            rejection_reason = "edited_message"
+        elif delay_seconds > MAX_CALL_DELAY_SECONDS:
+            rejection_reason = "late_submission"
+        elif call_is_duplicate(chat_id, ca_norm):
+            rejection_reason = "duplicate_ca"
+
+        if rejection_reason:
+            calls_collection.insert_one(
+                {
+                    "chat_id": chat_id,
+                    "status": "rejected",
+                    "reject_reason": rejection_reason,
+                    "ca": ca_norm,
+                    "ca_norm": ca_norm,
+                    "caller_id": user.id,
+                    "caller_name": user.full_name or user.first_name or "Unknown",
+                    "caller_username": user.username,
+                    "message_id": message_obj.message_id,
+                    "message_date": msg_time,
+                    "timestamp": now,
+                    "ingest_delay_seconds": delay_seconds,
+                }
+            )
+            update_user_profile(chat_id, user, "rejected", reason=rejection_reason)
+            continue
+
+        batch_data = get_dexscreener_batch([ca_norm])
+        mcap = batch_data.get(ca_norm)
+
         if mcap and mcap > 0:
             call_data = {
-                "ca": ca,
                 "chat_id": chat_id,
+                "status": "accepted",
+                "ca": ca_norm,
+                "ca_norm": ca_norm,
                 "caller_id": user.id,
-                "caller_name": user.first_name or "Unknown",
+                "caller_name": user.full_name or user.first_name or "Unknown",
                 "caller_username": user.username,
                 "initial_mcap": mcap,
                 "ath_mcap": mcap,
                 "current_mcap": mcap,
-                "timestamp": datetime.now(timezone.utc)
+                "timestamp": now,
+                "message_id": message_obj.message_id,
+                "message_date": msg_time,
+                "ingest_delay_seconds": delay_seconds,
             }
             calls_collection.insert_one(call_data)
-            
-            # Check settings (Default is False, so it stays silent unless toggled ON)
+            update_user_profile(chat_id, user, "accepted")
+
             setting = settings_collection.find_one({"chat_id": chat_id}) or {}
             if setting.get("alerts", False):
-                await update.message.reply_text(
-                    f"🎯 **New Call Tracked!**\n\n"
-                    f"🪙 CA: `{ca}`\n"
-                    f"👤 Caller: {user.first_name}\n"
-                    f"💰 Called at MCAP: ${mcap:,.2f}",
-                    parse_mode='Markdown'
+                await message_obj.reply_text(
+                    f"New call tracked\nCA: {ca_norm}\nCaller: {user.first_name}\nEntry MCAP: ${mcap:,.2f}"
                 )
 
-async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
-    chat_id = update.message.chat_id
-    query = {"chat_id": chat_id}
-    time_text = "All Time"
 
-    if context.args:
-        time_arg = context.args[0].lower()
-        try:
-            if time_arg.endswith('d'):
-                days = int(time_arg[:-1])
-                cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-                query["timestamp"] = {"$gte": cutoff}
-                time_text = f"Last {days} Days"
-            elif time_arg.endswith('h'):
-                hours = int(time_arg[:-1])
-                cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
-                query["timestamp"] = {"$gte": cutoff}
-                time_text = f"Last {hours} Hours"
-        except ValueError:
-            pass
+def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
+    query = {}
+    time_text = "All Time"
+    if not context.args:
+        return query, time_text
+
+    time_arg = context.args[0].lower()
+    try:
+        if time_arg.endswith("d"):
+            days = int(time_arg[:-1])
+            cutoff = utc_now() - timedelta(days=days)
+            query["timestamp"] = {"$gte": cutoff}
+            time_text = f"Last {days} Days"
+        elif time_arg.endswith("h"):
+            hours = int(time_arg[:-1])
+            cutoff = utc_now() - timedelta(hours=hours)
+            query["timestamp"] = {"$gte": cutoff}
+            time_text = f"Last {hours} Hours"
+    except ValueError:
+        pass
+
+    return query, time_text
+
+
+def refresh_calls_market_data(calls):
+    unique_cas = list({call.get("ca_norm", normalize_ca(call["ca"])) for call in calls if call.get("ca")})
+    latest_mcaps = get_dexscreener_batch(unique_cas)
+
+    for call in calls:
+        ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
+        current_mcap = latest_mcaps.get(ca_norm, call.get("current_mcap", call.get("initial_mcap", 0)))
+        if not current_mcap:
+            continue
+        ath = max(float(call.get("ath_mcap", current_mcap)), float(current_mcap))
+        calls_collection.update_one({"_id": call["_id"]}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
+        call["current_mcap"] = current_mcap
+        call["ath_mcap"] = ath
+
+
+async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DEFAULT_TYPE, is_bottom=False):
+    chat_id = update.effective_chat.id
+    base_filter = accepted_call_filter(chat_id)
+    time_filter, time_text = _resolve_time_filter(context)
+    query = {**base_filter, **time_filter}
 
     list_type = "Wall of Shame" if is_bottom else "Leaderboard"
-    status_message = await update.message.reply_text(f"🔄 Fetching {time_text} {list_type}...")
-    
+    status_message = await update.effective_message.reply_text(f"Fetching {time_text} {list_type}...")
+
     all_calls = list(calls_collection.find(query))
     if not all_calls:
-        await status_message.edit_text(f"No data for {time_text} in this group!")
+        await status_message.edit_text(f"No data for {time_text} in this group")
         return
 
-    unique_cas = list(set([call['ca'] for call in all_calls]))
-    latest_mcaps = get_dexscreener_batch(unique_cas)
-    
-    user_stats = {} 
+    refresh_calls_market_data(all_calls)
 
+    user_calls = {}
     for call in all_calls:
-        ca = call['ca']
-        current_mcap = latest_mcaps.get(ca.lower(), call['current_mcap'])
-        ath = max(call['ath_mcap'], current_mcap)
-        
-        calls_collection.update_one({"_id": call['_id']}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
-        
-        multiplier = ath / call['initial_mcap']
-        caller = call['caller_name']
-        
-        if caller not in user_stats:
-            user_stats[caller] = {'mults': [], 'wins': 0}
-        
-        user_stats[caller]['mults'].append(multiplier)
-        if multiplier >= WIN_MULTIPLIER:
-            user_stats[caller]['wins'] += 1
+        caller_key = get_caller_key(call)
+        user_calls.setdefault(caller_key, []).append(call)
 
     leaderboard_data = []
-    for user, data in user_stats.items():
-        total_calls = len(data['mults'])
-        
-        if total_calls >= MIN_CALLS_REQUIRED:
-            leaderboard_data.append({
-                'name': user, 
-                'avg': sum(data['mults']) / total_calls, 
-                'best': max(data['mults']), 
-                'total_calls': total_calls,
-                'hit_rate': (data['wins'] / total_calls) * 100
-            })
+    for caller_key, calls in user_calls.items():
+        metrics = derive_user_metrics(calls)
+        if metrics["calls"] < MIN_CALLS_REQUIRED:
+            continue
+
+        caller_id = calls[0].get("caller_id")
+        caller_name = calls[0].get("caller_name", "Unknown")
+        penalty = get_reputation_penalty(chat_id, caller_id)
+        score = max(0.0, metrics["reputation"] - penalty)
+
+        leaderboard_data.append(
+            {
+                "caller_key": caller_key,
+                "caller_id": caller_id,
+                "name": caller_name,
+                "calls": metrics["calls"],
+                "avg_ath_x": 1.0 + metrics["avg_ath"],
+                "avg_now_x": 1.0 + metrics["avg_now"],
+                "best_x": metrics["best_x"],
+                "win_rate": metrics["win_rate"] * 100,
+                "sharpe": metrics["sharpe"],
+                "mdd": metrics["max_drawdown"] * 100,
+                "score": score,
+                "level": metrics["level"],
+            }
+        )
 
     if not leaderboard_data:
-        await status_message.edit_text(f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked yet!")
+        await status_message.edit_text(f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked")
         return
 
-    leaderboard_data.sort(key=lambda x: x['avg'], reverse=not is_bottom)
-    
     if is_bottom:
-        context.chat_data['leaderboard_title'] = f"📉 **Wall of Shame ({time_text})** 📉"
+        leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"]))
+        title = f"Wall of Shame ({time_text})"
     else:
-        context.chat_data['leaderboard_title'] = f"🏆 **Yabai Callers ({time_text})** 🏆"
-        
-    context.chat_data['leaderboard_data'] = leaderboard_data
-    
+        leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"], x["calls"]), reverse=True)
+        title = f"Yabai Callers ({time_text})"
+
+    context.chat_data["leaderboard_title"] = title
+    context.chat_data["leaderboard_data"] = leaderboard_data
+
     await render_leaderboard_page(status_message, context, page=0)
+
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fetch_and_calculate_rankings(update, context, is_bottom=False)
 
+
 async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fetch_and_calculate_rankings(update, context, is_bottom=True)
 
+
+async def season(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        context.args = ["30d"]
+    await _fetch_and_calculate_rankings(update, context, is_bottom=False)
+
+
 async def render_leaderboard_page(message_obj, context, page=0):
-    data = context.chat_data.get('leaderboard_data', [])
-    title = context.chat_data.get('leaderboard_title', "Leaderboard")
-    
+    data = context.chat_data.get("leaderboard_data", [])
+    title = context.chat_data.get("leaderboard_title", "Leaderboard")
+
     items_per_page = 10
-    total_pages = math.ceil(len(data) / items_per_page)
-    
+    total_pages = max(1, math.ceil(len(data) / items_per_page))
+
     start_idx = page * items_per_page
     end_idx = start_idx + items_per_page
     page_data = data[start_idx:end_idx]
 
-    text = f"{title}\n*(Min. {MIN_CALLS_REQUIRED} calls to rank)*\n*Page {page + 1} of {total_pages}*\n\n"
-    
-    for idx, user in enumerate(page_data, start=start_idx + 1):
-        text += (f"{idx}. **{user['name']}** ({user['total_calls']} calls)\n"
-                 f"   📈 Avg: {user['avg']:.2f}x | 🔥 Best: {user['best']:.2f}x\n"
-                 f"   🎯 Win Rate: {user['hit_rate']:.1f}%\n\n")
+    lines = [
+        f"{title}",
+        f"Min {MIN_CALLS_REQUIRED} calls to rank",
+        f"Page {page + 1} of {total_pages}",
+        "",
+    ]
+
+    for idx, row in enumerate(page_data, start=start_idx + 1):
+        lines.append(
+            f"{idx}. {row['name']} [{row['level']}] ({row['calls']} calls)\n"
+            f"   Score {row['score']:.1f} | Win {row['win_rate']:.1f}% | Sharpe {row['sharpe']:.2f}\n"
+            f"   AvgATH {row['avg_ath_x']:.2f}x | AvgNow {row['avg_now_x']:.2f}x | Best {row['best_x']:.2f}x | MDD {row['mdd']:.1f}%"
+        )
+        lines.append("")
+
+    text = "\n".join(lines).strip()
 
     buttons = []
     if page > 0:
-        buttons.append(InlineKeyboardButton("◀️ Prev", callback_data=f"lb_{page-1}"))
+        buttons.append(InlineKeyboardButton("Prev", callback_data=f"lb_{page-1}"))
     if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next ▶️", callback_data=f"lb_{page+1}"))
-        
+        buttons.append(InlineKeyboardButton("Next", callback_data=f"lb_{page+1}"))
+
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
 
     try:
-        await message_obj.edit_text(text, reply_markup=reply_markup, parse_mode='Markdown')
+        await message_obj.edit_text(text, reply_markup=reply_markup)
     except Exception:
         pass
 
+
 async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer() 
-    page = int(query.data.split('_')[1])
-    if 'leaderboard_data' in context.chat_data:
+    await query.answer()
+    page = int(query.data.split("_")[1])
+    if "leaderboard_data" in context.chat_data:
         await render_leaderboard_page(query.message, context, page)
     else:
-        await query.message.edit_text("Data expired. Please run the command again.")
+        await query.message.edit_text("Data expired. Run the command again.")
+
 
 async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Please provide a name. Example: `/caller John`", parse_mode='Markdown')
+        await update.effective_message.reply_text("Provide a name or @username. Example: /caller John")
         return
 
     target = " ".join(context.args).replace("@", "")
-    chat_id = update.message.chat_id
-    
+    chat_id = update.effective_chat.id
+
     query = {
         "chat_id": chat_id,
-        "$or": [
-            {"caller_name": {"$regex": f"^{target}$", "$options": "i"}},
-            {"caller_username": {"$regex": f"^{target}$", "$options": "i"}}
-        ]
+        "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+        "$and": [
+            {
+                "$or": [
+                    {"caller_name": {"$regex": f"^{re.escape(target)}$", "$options": "i"}},
+                    {"caller_username": {"$regex": f"^{re.escape(target)}$", "$options": "i"}},
+                ]
+            }
+        ],
     }
-    
+
     all_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
-    
     if not all_user_calls:
-        await update.message.reply_text(f"I couldn't find any calls for '{target}' in this group.")
+        await update.effective_message.reply_text(f"No calls found for '{target}' in this group")
         return
 
-    total_calls = len(all_user_calls)
-    wins = sum(1 for c in all_user_calls if (max(c['ath_mcap'], c.get('current_mcap', 0)) / c['initial_mcap']) >= WIN_MULTIPLIER)
-    hit_rate = (wins / total_calls) * 100
+    refresh_calls_market_data(all_user_calls)
+    metrics = derive_user_metrics(all_user_calls)
 
     recent_calls = all_user_calls[:5]
-    ca_list = [c['ca'] for c in recent_calls]
-    batch_data = get_dexscreener_batch(ca_list)
-    
-    actual_name = recent_calls[0]['caller_name']
-    
-    text = (f"👤 **Profile: {actual_name}** 👤\n"
-            f"📞 Total Calls: {total_calls}\n"
-            f"🎯 Hit Rate (>= {WIN_MULTIPLIER}x): **{hit_rate:.1f}%**\n\n"
-            f"**Recent Plays:**\n\n")
-    
+    actual_name = recent_calls[0].get("caller_name", "Unknown")
+
+    lines = [
+        f"Profile: {actual_name}",
+        f"Calls: {metrics['calls']} | Level: {metrics['level']} | Reputation: {metrics['reputation']:.1f}",
+        f"Win Rate (>={WIN_MULTIPLIER:.1f}x): {metrics['win_rate'] * 100:.1f}%",
+        f"Sharpe: {metrics['sharpe']:.2f} | Max Drawdown: {metrics['max_drawdown'] * 100:.1f}%",
+        f"Risk-Adjusted Return: {metrics['risk_adjusted_return'] * 100:.1f}%",
+        f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}",
+        "",
+        "Recent calls:",
+    ]
+
     for call in recent_calls:
-        ca = call['ca']
-        current_mcap = batch_data.get(ca.lower(), call['current_mcap'])
-        ath = max(call['ath_mcap'], current_mcap)
-        
-        calls_collection.update_one({"_id": call['_id']}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
-        
-        initial = call['initial_mcap']
-        call_date = call.get('timestamp', datetime.now(timezone.utc)).strftime('%Y-%m-%d')
-        short_ca = f"{ca[:6]}...{ca[-4:]}"
-        
-        text += (f"🪙 `{short_ca}` ({call_date})\n"
-                 f"🟢 Entry: ${initial:,.0f}\n"
-                 f"🔥 ATH: **{(ath/initial):.2f}x** | 💰 Now: **{(current_mcap/initial):.2f}x**\n\n")
+        ca = call.get("ca", "")
+        initial = float(call.get("initial_mcap", 0) or 0)
+        current = float(call.get("current_mcap", initial) or initial)
+        ath = float(call.get("ath_mcap", current) or current)
+        if initial <= 0:
+            continue
+        call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
+        short_ca = f"{ca[:6]}...{ca[-4:]}" if len(ca) > 10 else ca
+        lines.append(
+            f"- {short_ca} ({call_date}) Entry ${initial:,.0f} | ATH {(ath / initial):.2f}x | Now {(current / initial):.2f}x"
+        )
 
-    await update.message.reply_text(text, parse_mode='Markdown')
+    await update.effective_message.reply_text("\n".join(lines))
 
-async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.message.chat_id
-    status_message = await update.message.reply_text("🔄 Analyzing group performance...")
 
-    all_calls = list(calls_collection.find({"chat_id": chat_id}))
-    if not all_calls:
-        await status_message.edit_text("No calls tracked in this group yet!")
+async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+
+    user_calls = list(
+        calls_collection.find(
+            {
+                "chat_id": chat_id,
+                "caller_id": user.id,
+                "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+            }
+        )
+    )
+
+    if not user_calls:
+        await update.effective_message.reply_text("You do not have tracked calls yet.")
         return
 
-    total_calls = len(all_calls)
-    unique_callers = set()
-    total_wins = 0
-    total_mults = []
-    best_call_x = 0
-    best_call_caller = ""
-    best_call_ca = ""
+    refresh_calls_market_data(user_calls)
+    metrics = derive_user_metrics(user_calls)
 
-    for call in all_calls:
-        unique_callers.add(call['caller_name'])
-        mult = max(call['ath_mcap'], call['current_mcap']) / call['initial_mcap']
-        total_mults.append(mult)
-        
-        if mult >= WIN_MULTIPLIER:
-            total_wins += 1
-            
-        if mult > best_call_x:
-            best_call_x = mult
-            best_call_caller = call['caller_name']
-            best_call_ca = call['ca']
-
-    group_hit_rate = (total_wins / total_calls) * 100
-    group_avg_x = sum(total_mults) / total_calls
-    short_best_ca = f"{best_call_ca[:6]}...{best_call_ca[-4:]}" if best_call_ca else "N/A"
+    profile = user_profiles_collection.find_one({"chat_id": chat_id, "user_id": user.id}) or {}
+    rejected = int(profile.get("rejected_calls", 0) or 0)
+    penalty = get_reputation_penalty(chat_id, user.id)
+    effective_reputation = max(0.0, metrics["reputation"] - penalty)
 
     text = (
-        f"📊 **Group Performance Overview** 📊\n\n"
-        f"👥 **Total Callers:** {len(unique_callers)}\n"
-        f"📞 **Total Calls Tracked:** {total_calls}\n"
-        f"🎯 **Group Win Rate (>= {WIN_MULTIPLIER}x):** {group_hit_rate:.1f}%\n\n"
-        f"📈 **Group Average:** {group_avg_x:.2f}x\n"
-        f"🔥 **Best Call All-Time:** {best_call_x:.2f}x\n"
-        f"   └ By {best_call_caller} (`{short_best_ca}`)"
+        f"Your score\n"
+        f"Calls: {metrics['calls']} | Level: {metrics['level']} | Reputation: {effective_reputation:.1f}\n"
+        f"Win Rate (>={WIN_MULTIPLIER:.1f}x): {metrics['win_rate'] * 100:.1f}%\n"
+        f"Avg ATH: {1 + metrics['avg_ath']:.2f}x | Avg Now: {1 + metrics['avg_now']:.2f}x\n"
+        f"Sharpe: {metrics['sharpe']:.2f} | MDD: {metrics['max_drawdown'] * 100:.1f}%\n"
+        f"Consistency: {metrics['consistency'] * 100:.1f}% | Rejected attempts: {rejected} | Penalty: {penalty:.1f}\n"
+        f"Badges: {', '.join(metrics['badges']) if metrics['badges'] else 'None'}"
     )
-    
-    await status_message.edit_text(text, parse_mode='Markdown')
+    await update.effective_message.reply_text(text)
+
+
+async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    status_message = await update.effective_message.reply_text("Analyzing group performance...")
+
+    all_calls = list(calls_collection.find(accepted_call_filter(chat_id)))
+    if not all_calls:
+        await status_message.edit_text("No calls tracked in this group yet")
+        return
+
+    refresh_calls_market_data(all_calls)
+
+    total_calls = len(all_calls)
+    unique_callers = set(call.get("caller_id") for call in all_calls if call.get("caller_id") is not None)
+
+    group_metrics = derive_user_metrics(all_calls)
+
+    best_call = max(
+        all_calls,
+        key=lambda c: (float(c.get("ath_mcap", 0) or 0) / float(c.get("initial_mcap", 1) or 1)),
+        default=None,
+    )
+
+    best_text = "N/A"
+    if best_call:
+        initial = float(best_call.get("initial_mcap", 1) or 1)
+        best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
+        ca = best_call.get("ca", "")
+        short_ca = f"{ca[:6]}...{ca[-4:]}" if len(ca) > 10 else ca
+        best_text = f"{best_x:.2f}x by {best_call.get('caller_name', 'Unknown')} ({short_ca})"
+
+    text = (
+        f"Group performance overview\n\n"
+        f"Total callers: {len(unique_callers)}\n"
+        f"Total accepted calls: {total_calls}\n"
+        f"Group win rate (>={WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n"
+        f"Group avg ATH: {1 + group_metrics['avg_ath']:.2f}x\n"
+        f"Group avg Now: {1 + group_metrics['avg_now']:.2f}x\n"
+        f"Group Sharpe: {group_metrics['sharpe']:.2f}\n"
+        f"Best call all-time: {best_text}"
+    )
+
+    await status_message.edit_text(text)
+
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("Please provide a CA. Example: `/stats <CA>`", parse_mode='Markdown')
+        await update.effective_message.reply_text("Provide a CA. Example: /stats <CA>")
         return
 
-    ca = context.args[0]
-    call = calls_collection.find_one({"ca": ca, "chat_id": update.message.chat_id})
+    ca = normalize_ca(context.args[0])
+    chat_id = update.effective_chat.id
+
+    call = calls_collection.find_one(
+        {
+            "chat_id": chat_id,
+            "ca_norm": ca,
+            "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+        }
+    )
 
     if not call:
-        await update.message.reply_text("I don't have that CA tracked in this group's database yet!")
+        call = calls_collection.find_one(
+            {
+                "chat_id": chat_id,
+                "ca": ca,
+                "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+            }
+        )
+
+    if not call:
+        await update.effective_message.reply_text("This CA is not tracked in this group yet")
         return
 
     batch_data = get_dexscreener_batch([ca])
-    current_mcap = batch_data.get(ca.lower())
-    
-    if current_mcap:
-        ath = max(call['ath_mcap'], current_mcap)
-        calls_collection.update_one({"_id": call['_id']}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
-        
-        current_x = current_mcap / call['initial_mcap']
-        ath_x = ath / call['initial_mcap']
+    current_mcap = batch_data.get(ca)
 
-        text = (
-            f"📊 **Stats for Token**\n`{ca}`\n\n"
-            f"👤 Called by: {call['caller_name']}\n"
-            f"🟢 Called at: ${call['initial_mcap']:,.2f}\n"
-            f"🔥 ATH: ${ath:,.2f} (**{ath_x:.2f}x**)\n"
-            f"💰 Current: ${current_mcap:,.2f} (**{current_x:.2f}x**)"
+    if not current_mcap:
+        await update.effective_message.reply_text("Failed to fetch current data from DexScreener")
+        return
+
+    ath = max(float(call.get("ath_mcap", current_mcap) or current_mcap), float(current_mcap))
+    calls_collection.update_one({"_id": call["_id"]}, {"$set": {"current_mcap": current_mcap, "ath_mcap": ath}})
+
+    initial = float(call.get("initial_mcap", 1) or 1)
+    current_x = current_mcap / initial
+    ath_x = ath / initial
+
+    text = (
+        f"Token stats\n{ca}\n\n"
+        f"Called by: {call.get('caller_name', 'Unknown')}\n"
+        f"Entry MCAP: ${initial:,.2f}\n"
+        f"ATH: ${ath:,.2f} ({ath_x:.2f}x)\n"
+        f"Current: ${current_mcap:,.2f} ({current_x:.2f}x)"
+    )
+    await update.effective_message.reply_text(text)
+
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    member = await context.bot.get_chat_member(chat.id, user.id)
+    if member.status not in {"administrator", "creator"}:
+        await msg.reply_text("Admin only command")
+        return
+
+    base = {"chat_id": chat.id}
+    accepted = calls_collection.count_documents({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]})
+    rejected = calls_collection.count_documents({**base, "status": "rejected"})
+
+    reason_counts = list(
+        calls_collection.aggregate(
+            [
+                {"$match": {**base, "status": "rejected"}},
+                {"$group": {"_id": "$reject_reason", "count": {"$sum": 1}}},
+                {"$sort": {"count": -1}},
+            ]
         )
-        await update.message.reply_text(text, parse_mode='Markdown')
+    )
+
+    suspicious = list(
+        user_profiles_collection.find({"chat_id": chat.id})
+        .sort("rejected_calls", -1)
+        .limit(5)
+    )
+
+    delay_pipeline = [
+        {
+            "$match": {
+                **base,
+                "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+                "ingest_delay_seconds": {"$exists": True},
+            }
+        },
+        {
+            "$group": {
+                "_id": None,
+                "avg_delay": {"$avg": "$ingest_delay_seconds"},
+                "max_delay": {"$max": "$ingest_delay_seconds"},
+            }
+        },
+    ]
+    delay_stats = list(calls_collection.aggregate(delay_pipeline))
+    avg_delay = delay_stats[0]["avg_delay"] if delay_stats else 0
+    max_delay = delay_stats[0]["max_delay"] if delay_stats else 0
+
+    lines = [
+        "Admin analytics",
+        f"Accepted calls: {accepted}",
+        f"Rejected attempts: {rejected}",
+        f"Acceptance ratio: {(accepted / (accepted + rejected) * 100) if (accepted + rejected) else 0:.1f}%",
+        f"Ingest delay avg/max: {avg_delay:.1f}s / {max_delay:.0f}s",
+        "",
+        "Top reject reasons:",
+    ]
+
+    if reason_counts:
+        for row in reason_counts[:5]:
+            lines.append(f"- {row['_id'] or 'unknown'}: {row['count']}")
     else:
-        await update.message.reply_text("Failed to fetch current data from DexScreener.")
+        lines.append("- None")
+
+    lines.append("")
+    lines.append("Most suspicious users:")
+    if suspicious:
+        for row in suspicious:
+            name = row.get("display_name", "Unknown")
+            rej = row.get("rejected_calls", 0)
+            acc = row.get("accepted_calls", 0)
+            lines.append(f"- {name}: rejected {rej}, accepted {acc}")
+    else:
+        lines.append("- None")
+
+    await msg.reply_text("\n".join(lines))
+
 
 def main():
+    ensure_indexes()
+
     app = Application.builder().token(TOKEN).build()
-    
+
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, track_ca))
+    app.add_handler(MessageHandler(filters.UpdateType.EDITED_MESSAGE & filters.TEXT & ~filters.COMMAND, track_ca))
+
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("bottom", bottom))
+    app.add_handler(CommandHandler("season", season))
     app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("togglealerts", toggle_alerts))
-    app.add_handler(CommandHandler("caller", caller_profile)) 
-    app.add_handler(CommandHandler("groupstats", group_stats)) 
-    
-    app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern='^lb_'))
-    
-    print("YabaiRankBot is running silently by default!")
+    app.add_handler(CommandHandler("caller", caller_profile))
+    app.add_handler(CommandHandler("groupstats", group_stats))
+    app.add_handler(CommandHandler("myscore", my_score))
+    app.add_handler(CommandHandler("adminstats", admin_stats))
+
+    app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
+
+    print("YabaiRankBot running")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
