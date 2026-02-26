@@ -497,12 +497,6 @@ async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fetch_and_calculate_rankings(update, context, is_bottom=True)
 
 
-async def season(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        context.args = ["30d"]
-    await _fetch_and_calculate_rankings(update, context, is_bottom=False)
-
-
 async def render_leaderboard_page(message_obj, context, page=0):
     data = context.chat_data.get("leaderboard_data", [])
     title = context.chat_data.get("leaderboard_title", "Leaderboard")
@@ -613,6 +607,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"   📈 ATH: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
             f"   <code>{html.escape(ca)}</code>"
         )
+        lines.append("")
 
     await update.effective_message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -656,10 +651,11 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     status_message = await update.effective_message.reply_text("Analyzing group performance...")
-
-    all_calls = list(calls_collection.find(accepted_call_filter(chat_id)))
+    time_filter, time_text = _resolve_time_filter(context)
+    query = {**accepted_call_filter(chat_id), **time_filter}
+    all_calls = list(calls_collection.find(query))
     if not all_calls:
-        await status_message.edit_text("No calls tracked in this group yet")
+        await status_message.edit_text(f"No calls tracked in this group for {time_text}")
         return
 
     refresh_calls_market_data(all_calls)
@@ -691,7 +687,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         best_by_text = "   └ By N/A"
 
     text = (
-        f"📊 Group Performance Overview 📊\n\n"
+        f"📊 Group Performance Overview ({time_text}) 📊\n\n"
         f"👥 Total Callers: {len(unique_callers)}\n"
         f"📞 Total Calls Tracked: {total_calls}\n"
         f"🎯 Group Win Rate (>= {WIN_MULTIPLIER:.1f}x): {group_metrics['win_rate'] * 100:.1f}%\n\n"
@@ -701,65 +697,6 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     await status_message.edit_text(text, parse_mode="HTML")
-
-
-async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.effective_message.reply_text("Provide a CA. Example: /stats <CA>")
-        return
-
-    ca = normalize_ca(context.args[0])
-    chat_id = update.effective_chat.id
-
-    call = calls_collection.find_one(
-        {
-            "chat_id": chat_id,
-            "ca_norm": ca,
-            "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
-        }
-    )
-
-    if not call:
-        call = calls_collection.find_one(
-            {
-                "chat_id": chat_id,
-                "ca": ca,
-                "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
-            }
-        )
-
-    if not call:
-        await update.effective_message.reply_text("This CA is not tracked in this group yet")
-        return
-
-    batch_data = get_dexscreener_batch_meta([ca])
-    token_meta = batch_data.get(ca, {})
-    current_mcap = token_meta.get("fdv")
-    symbol = token_meta.get("symbol") or call.get("token_symbol", "")
-
-    if not current_mcap:
-        await update.effective_message.reply_text("Failed to fetch current data from DexScreener")
-        return
-
-    ath = max(float(call.get("ath_mcap", current_mcap) or current_mcap), float(current_mcap))
-    update_fields = {"current_mcap": current_mcap, "ath_mcap": ath}
-    if symbol:
-        update_fields["token_symbol"] = symbol
-    calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
-
-    initial = float(call.get("initial_mcap", 1) or 1)
-    current_x = current_mcap / initial
-    ath_x = ath / initial
-
-    text = (
-        f"🪙 Token: {html.escape(token_label(symbol, ca))}\n"
-        f"<code>{html.escape(ca)}</code>\n\n"
-        f"👤 Called by: {html.escape(call.get('caller_name', 'Unknown'))}\n"
-        f"📈 ATH: {format_return(ath_x)}\n"
-        f"💰 Current: {format_return(current_x)}\n"
-        f"🏁 Entry MCAP: ${initial:,.2f}"
-    )
-    await update.effective_message.reply_text(text, parse_mode="HTML")
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -883,8 +820,6 @@ def main():
 
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("bottom", bottom))
-    app.add_handler(CommandHandler("season", season))
-    app.add_handler(CommandHandler("stats", stats))
     app.add_handler(CommandHandler("togglealerts", toggle_alerts))
     app.add_handler(CommandHandler("caller", caller_profile))
     app.add_handler(CommandHandler("groupstats", group_stats))
