@@ -160,6 +160,12 @@ def wrap_text_lines(draw, text, font, max_width, max_lines=2):
     return lines
 
 
+def ascii_safe(text, fallback="N/A"):
+    cleaned = "".join(ch for ch in str(text or "") if ord(ch) < 128)
+    cleaned = " ".join(cleaned.split()).strip()
+    return cleaned if cleaned else fallback
+
+
 def format_return(x_value):
     if isinstance(x_value, str):
         raw = x_value.strip().lower()
@@ -336,15 +342,15 @@ def generate_leaderboard_spotlight_card(title, top_name, top_avg, top_best, top_
     safe_title = fit_text(draw, title, sub_font, 620)
     safe_name = fit_text(draw, top_name, block_font, 560)
 
-    draw.text((left_x, 54), "🏆 LEADERBOARD SPOTLIGHT", font=title_font, fill=(241, 247, 255))
+    draw.text((left_x, 54), "LEADERBOARD SPOTLIGHT", font=title_font, fill=(241, 247, 255))
     draw.text((left_x + 2, 112), safe_title, font=sub_font, fill=(161, 203, 235))
 
-    draw.text((left_x, 175), f"1) {safe_name}", font=block_font, fill=(255, 255, 255))
+    draw.text((left_x, 175), f"#1 {safe_name}", font=block_font, fill=(255, 255, 255))
     draw.text((left_x, 228), fit_text(draw, f"Avg {top_avg} • Best {top_best}", stat_font, 620), font=stat_font, fill=(141, 255, 113))
     draw.text((left_x, 304), f"Hit Rate {top_win_rate:.1f}%", font=block_font, fill=(217, 236, 255))
 
     draw.text((right_x, 180), "Best Win Window", font=block_font, fill=(204, 231, 255))
-    lines = wrap_text_lines(draw, best_win_text, sub_font, right_w, max_lines=3)
+    lines = wrap_text_lines(draw, ascii_safe(best_win_text, fallback="N/A"), sub_font, right_w, max_lines=3)
     y = 228
     for line in lines:
         draw.text((right_x, y), line, font=sub_font, fill=(255, 255, 255))
@@ -1017,12 +1023,9 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
     time_filter, time_text = _resolve_time_filter(context)
     query = {**base_filter, **time_filter}
 
-    list_type = "Wall of Shame" if is_bottom else "Leaderboard"
-    status_message = await update.effective_message.reply_text(f"Fetching {time_text} {list_type}...")
-
     all_calls = list(calls_collection.find(query))
     if not all_calls:
-        await status_message.edit_text(f"No data for {time_text} in this group")
+        await update.effective_message.reply_text(f"No data for {time_text} in this group")
         return
 
     refresh_calls_market_data(all_calls)
@@ -1071,7 +1074,9 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
         )
 
     if not leaderboard_data:
-        await status_message.edit_text(f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked")
+        await update.effective_message.reply_text(
+            f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked"
+        )
         return
 
     if is_bottom:
@@ -1090,28 +1095,26 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
         try:
             top = leaderboard_data[0]
             spotlight = generate_leaderboard_spotlight_card(
-                title=title,
-                top_name=top["name"],
-                top_avg=format_return(top["avg_now_x"]),
-                top_best=format_return(top["best_x"]),
+                title=ascii_safe(title, fallback="Yabai Leaderboard"),
+                top_name=ascii_safe(top["name"], fallback="Top Caller"),
+                top_avg=ascii_safe(format_return(top["avg_now_x"]), fallback="N/A"),
+                top_best=ascii_safe(format_return(top["best_x"]), fallback="N/A"),
                 top_win_rate=top["win_rate"],
-                best_win_text=best_win_text,
+                best_win_text=ascii_safe(best_win_text, fallback="N/A"),
             )
             context.chat_data["leaderboard_image_mode"] = True
-            photo_message = await update.effective_message.reply_photo(
+            caption_text, reply_markup = build_leaderboard_page(context, page=0)
+            await update.effective_message.reply_photo(
                 photo=spotlight,
-                caption="Loading leaderboard...",
+                caption=caption_text,
+                reply_markup=reply_markup,
             )
-            try:
-                await status_message.delete()
-            except Exception:
-                pass
-            await render_leaderboard_page(photo_message, context, page=0)
             return
         except Exception:
             context.chat_data["leaderboard_image_mode"] = False
 
-    await render_leaderboard_page(status_message, context, page=0)
+    text, reply_markup = build_leaderboard_page(context, page=0)
+    await update.effective_message.reply_text(text, reply_markup=reply_markup)
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1122,7 +1125,7 @@ async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fetch_and_calculate_rankings(update, context, is_bottom=True)
 
 
-async def render_leaderboard_page(message_obj, context, page=0):
+def build_leaderboard_page(context, page=0):
     data = context.chat_data.get("leaderboard_data", [])
     title = context.chat_data.get("leaderboard_title", "Leaderboard")
     best_win_text = context.chat_data.get("leaderboard_best_win", "N/A")
@@ -1163,6 +1166,12 @@ async def render_leaderboard_page(message_obj, context, page=0):
         buttons.append(InlineKeyboardButton("Next", callback_data=f"lb_{page+1}"))
 
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    return text, reply_markup
+
+
+async def render_leaderboard_page(message_obj, context, page=0):
+    image_mode = bool(context.chat_data.get("leaderboard_image_mode", False))
+    text, reply_markup = build_leaderboard_page(context, page=page)
 
     try:
         if image_mode:
