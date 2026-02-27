@@ -40,6 +40,7 @@ RUG_CURRENT_MAX_X = 0.30
 RUG_MIN_AGE_HOURS = 12
 ATH_TRACK_WINDOW_DAYS = 7
 ATH_TRACK_MAX_CALLS_PER_CHAT = 800
+LOW_VOLUME_STASH_THRESHOLD = 1000.0
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -61,6 +62,7 @@ def ensure_indexes():
         ("status", ASCENDING),
     ])
     calls_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_collection.create_index([("chat_id", ASCENDING), ("is_stashed", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("message_id", ASCENDING), ("chat_id", ASCENDING)])
 
@@ -281,6 +283,7 @@ def generate_group_stats_card(
     avg_text,
     best_text,
     best_caller,
+    group_avatar_image=None,
 ):
     width, height = 1200, 440
     card = Image.new("RGB", (width, height), (14, 22, 38))
@@ -314,6 +317,15 @@ def generate_group_stats_card(
     draw.text((right_x, 228), fit_text(draw, best_text, stat_font, right_w), font=stat_font, fill=(255, 255, 255))
     best_caller_text = f"By {ascii_safe(best_caller, fallback='N/A')}"
     draw.text((right_x, 286), fit_text(draw, best_caller_text, block_font, right_w), font=block_font, fill=(217, 236, 255))
+
+    group_avatar = build_circle_avatar(group_avatar_image, 88) if group_avatar_image is not None else None
+    if group_avatar is not None:
+        icon_x, icon_y = 1060, 44
+        card_rgba = card.convert("RGBA")
+        card_rgba.alpha_composite(group_avatar, (icon_x, icon_y))
+        ring = ImageDraw.Draw(card_rgba)
+        ring.ellipse((icon_x - 3, icon_y - 3, icon_x + 90, icon_y + 90), outline=(130, 190, 236, 200), width=3)
+        card = card_rgba.convert("RGB")
 
     buffer = BytesIO()
     card.save(buffer, format="PNG", optimize=True)
@@ -465,6 +477,7 @@ def generate_leaderboard_spotlight_card(
     highlight_text,
     highlight_label="Best Win Window",
     theme="leaderboard",
+    group_avatar_image=None,
 ):
     width, height = 1200, 440
     card = Image.new("RGB", (width, height), (14, 22, 38))
@@ -518,6 +531,16 @@ def generate_leaderboard_spotlight_card(
         draw.text((right_x, y), line, font=sub_font, fill=(255, 255, 255))
         y += 34
 
+    group_avatar = build_circle_avatar(group_avatar_image, 84) if group_avatar_image is not None else None
+    if group_avatar is not None:
+        icon_x, icon_y = 1064, 46
+        ring_color = (215, 105, 115, 210) if theme == "danger" else (130, 190, 236, 210)
+        card_rgba = card.convert("RGBA")
+        card_rgba.alpha_composite(group_avatar, (icon_x, icon_y))
+        ring = ImageDraw.Draw(card_rgba)
+        ring.ellipse((icon_x - 3, icon_y - 3, icon_x + 86, icon_y + 86), outline=ring_color, width=3)
+        card = card_rgba.convert("RGB")
+
     buffer = BytesIO()
     card.save(buffer, format="PNG", optimize=True)
     buffer.seek(0)
@@ -559,6 +582,7 @@ def get_dexscreener_batch_meta(cas_list):
                             results[addr_lower] = {
                                 "fdv": float(metric),
                                 "symbol": symbol.upper() if symbol else "",
+                                "volume_h24": float(volume_h24),
                                 "_score": score,
                             }
         except Exception as exc:
@@ -801,6 +825,22 @@ async def user_is_admin(bot, chat_id, user_id):
     return member.status in {"administrator", "creator"}
 
 
+async def fetch_chat_avatar_image(bot, chat_id):
+    try:
+        chat = await bot.get_chat(chat_id)
+        photo = getattr(chat, "photo", None)
+        if not photo:
+            return None
+        file_id = getattr(photo, "big_file_id", None) or getattr(photo, "small_file_id", None)
+        if not file_id:
+            return None
+        file_obj = await bot.get_file(file_id)
+        data = await file_obj.download_as_bytearray()
+        return Image.open(BytesIO(data)).convert("RGB")
+    except Exception:
+        return None
+
+
 def _accepted_query(chat_id, extra=None):
     query = accepted_call_filter(chat_id)
     if extra:
@@ -812,14 +852,14 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
     cutoff = utc_now() - timedelta(days=lookback_days)
     calls = list(
         calls_collection.find(
-            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})
+            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}, "is_stashed": {"$ne": True}})
         )
         .sort("timestamp", -1)
         .limit(limit)
     )
     if not calls:
         return 0
-    refresh_calls_market_data(calls)
+    refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=True)
     return len(calls)
 
 
@@ -828,28 +868,38 @@ def refresh_all_call_peaks(chat_id):
     if not calls:
         return {"calls": 0, "tokens": 0, "updated": 0}
     tokens = len({call.get("ca_norm", normalize_ca(call.get("ca", ""))) for call in calls if call.get("ca")})
-    updated = refresh_calls_market_data(calls)
+    updated = refresh_calls_market_data(calls, include_stashed=True, apply_stash_policy=True)
     return {"calls": len(calls), "tokens": tokens, "updated": updated}
 
 
-def bump_live_ath_for_chat(chat_id, token_meta_map):
+def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
     if not token_meta_map:
         return {"matched": 0, "modified": 0}
 
     total_matched = 0
     total_modified = 0
+    now = utc_now()
     for ca_norm, token_meta in token_meta_map.items():
         mcap = float(token_meta.get("fdv", 0) or 0)
         if mcap <= 0:
             continue
+        volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
 
         update_doc = {
-            "$set": {"current_mcap": mcap},
+            "$set": {
+                "current_mcap": mcap,
+                "volume_h24": volume_h24,
+                "last_market_refresh_at": now,
+            },
             "$max": {"ath_mcap": mcap},
         }
         symbol = token_meta.get("symbol")
         if symbol:
             update_doc["$set"]["token_symbol"] = symbol
+        if reactivate:
+            update_doc["$set"]["is_stashed"] = False
+            update_doc["$set"]["last_reactivated_at"] = now
+            update_doc["$unset"] = {"stashed_reason": "", "stashed_at": ""}
 
         result = calls_collection.update_many(
             _accepted_query(chat_id, {"ca_norm": ca_norm}),
@@ -1241,7 +1291,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     found_cas_list = sorted(found_cas)
     batch_data = get_dexscreener_batch_meta(found_cas_list)
-    bump_live_ath_for_chat(chat_id, batch_data)
+    bump_live_ath_for_chat(chat_id, batch_data, reactivate=True)
 
     is_edited = update.edited_message is not None
 
@@ -1284,6 +1334,8 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_meta = batch_data.get(ca_norm, {})
         mcap = token_meta.get("fdv")
         symbol = token_meta.get("symbol", "")
+        volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
+        is_stashed = volume_h24 < LOW_VOLUME_STASH_THRESHOLD
 
         if mcap and mcap > 0:
             call_data = {
@@ -1298,11 +1350,16 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ath_mcap": mcap,
                 "current_mcap": mcap,
                 "token_symbol": symbol,
+                "volume_h24": volume_h24,
+                "is_stashed": is_stashed,
                 "timestamp": now,
                 "message_id": message_obj.message_id,
                 "message_date": msg_time,
                 "ingest_delay_seconds": delay_seconds,
             }
+            if is_stashed:
+                call_data["stashed_reason"] = "low_volume"
+                call_data["stashed_at"] = now
             calls_collection.insert_one(call_data)
             update_user_profile(chat_id, user, "accepted")
 
@@ -1331,29 +1388,61 @@ def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
     return query, time_text
 
 
-def refresh_calls_market_data(calls):
-    unique_cas = list({call.get("ca_norm", normalize_ca(call["ca"])) for call in calls if call.get("ca")})
+def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=False):
+    refresh_targets = []
+    for call in calls:
+        if not call.get("ca"):
+            continue
+        if not include_stashed and bool(call.get("is_stashed", False)):
+            continue
+        refresh_targets.append(call)
+
+    unique_cas = list({call.get("ca_norm", normalize_ca(call["ca"])) for call in refresh_targets})
     if not unique_cas:
         return 0
     latest_meta = get_dexscreener_batch_meta(unique_cas)
     updated = 0
+    now = utc_now()
 
-    for call in calls:
+    for call in refresh_targets:
         ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
         meta = latest_meta.get(ca_norm, {})
         current_mcap = meta.get("fdv", call.get("current_mcap", call.get("initial_mcap", 0)))
         if not current_mcap:
             continue
         ath = max(float(call.get("ath_mcap", current_mcap)), float(current_mcap))
-        update_fields = {"current_mcap": current_mcap, "ath_mcap": ath}
+        volume_h24 = float(meta.get("volume_h24", call.get("volume_h24", 0)) or 0)
+        update_fields = {
+            "current_mcap": current_mcap,
+            "ath_mcap": ath,
+            "volume_h24": volume_h24,
+            "last_market_refresh_at": now,
+        }
+        unset_fields = {}
         if meta.get("symbol"):
             update_fields["token_symbol"] = meta["symbol"]
-        result = calls_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
+        if apply_stash_policy:
+            if volume_h24 < LOW_VOLUME_STASH_THRESHOLD:
+                update_fields["is_stashed"] = True
+                update_fields["stashed_reason"] = "low_volume"
+                update_fields["stashed_at"] = now
+            else:
+                update_fields["is_stashed"] = False
+                unset_fields["stashed_reason"] = ""
+                unset_fields["stashed_at"] = ""
+
+        update_doc = {"$set": update_fields}
+        if unset_fields:
+            update_doc["$unset"] = unset_fields
+        result = calls_collection.update_one({"_id": call["_id"]}, update_doc)
         updated += int(result.modified_count or 0)
         call["current_mcap"] = current_mcap
         call["ath_mcap"] = ath
+        call["volume_h24"] = volume_h24
         if meta.get("symbol"):
             call["token_symbol"] = meta["symbol"]
+        if apply_stash_policy:
+            call["is_stashed"] = volume_h24 < LOW_VOLUME_STASH_THRESHOLD
     return updated
 
 
@@ -1438,6 +1527,7 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
     context.chat_data["leaderboard_image_mode"] = False
 
     try:
+        group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
         top = leaderboard_data[0]
         spotlight = generate_leaderboard_spotlight_card(
             title=ascii_safe(title, fallback="Yabai Leaderboard"),
@@ -1448,6 +1538,7 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
             highlight_text=ascii_safe(highlight_text, fallback="N/A"),
             highlight_label=ascii_safe(highlight_label, fallback="Highlight"),
             theme="danger" if is_bottom else "leaderboard",
+            group_avatar_image=group_avatar_image,
         )
         context.chat_data["leaderboard_image_mode"] = True
         caption_text, reply_markup = build_leaderboard_page(context, page=0)
@@ -1781,6 +1872,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("📊 Mini Chart", callback_data="chart_group")]]
     )
+    group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
 
     card_image = generate_group_stats_card(
         time_text=time_text,
@@ -1790,6 +1882,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         avg_text=format_return(1 + group_metrics["avg_now"]),
         best_text=best_text,
         best_caller=best_caller,
+        group_avatar_image=group_avatar_image,
     )
 
     try:
