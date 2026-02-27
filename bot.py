@@ -41,7 +41,8 @@ RUG_CURRENT_MAX_X = 0.30
 RUG_MIN_AGE_HOURS = 12
 ATH_TRACK_WINDOW_DAYS = 7
 ATH_TRACK_MAX_CALLS_PER_CHAT = 800
-HEARTBEAT_CALLS_PER_CALLER = 3
+HEARTBEAT_CALLS_PER_CALLER = 2
+INACTIVE_CALLER_ARCHIVE_HOURS = 24
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
@@ -1278,6 +1279,16 @@ def _accepted_query(chat_id, extra=None):
     return query
 
 
+def _mongo_caller_key_expr():
+    return {
+        "$cond": [
+            {"$ne": ["$caller_id", None]},
+            {"$concat": ["id:", {"$toString": "$caller_id"}]},
+            {"$concat": ["legacy:", {"$toLower": {"$ifNull": ["$caller_name", "unknown"]}}]},
+        ]
+    }
+
+
 def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER):
     active_calls = list(
         calls_collection.find(
@@ -1354,6 +1365,56 @@ def archive_stashed_calls(chat_id, reason="older_call", limit=1000):
     return int(result.deleted_count or 0)
 
 
+def archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000):
+    if inactive_hours <= 0:
+        return 0
+
+    cutoff = utc_now() - timedelta(hours=int(inactive_hours))
+    caller_key_expr = _mongo_caller_key_expr()
+    inactive_pipeline = [
+        {"$match": _accepted_query(chat_id)},
+        {"$addFields": {"_caller_key": caller_key_expr}},
+        {"$sort": {"timestamp": -1}},
+        {"$group": {"_id": "$_caller_key", "latest_ts": {"$first": "$timestamp"}}},
+        {"$match": {"latest_ts": {"$lt": cutoff}}},
+        {"$limit": 1000},
+    ]
+    inactive_rows = list(calls_collection.aggregate(inactive_pipeline, allowDiskUse=True))
+    inactive_keys = [row.get("_id") for row in inactive_rows if row.get("_id")]
+    if not inactive_keys:
+        return 0
+
+    candidates = list(
+        calls_collection.find(
+            {
+                **_accepted_query(chat_id),
+                "$expr": {"$in": [caller_key_expr, inactive_keys]},
+            },
+            {"message_id": 0, "message_date": 0, "caller_username": 0, "ca": 0},
+        )
+        .sort("timestamp", 1)
+        .limit(int(limit))
+    )
+    if not candidates:
+        return 0
+
+    archive_docs = []
+    ids = []
+    for doc in candidates:
+        if not doc.get("stashed_reason"):
+            doc["stashed_reason"] = "inactive_caller"
+        archive_docs.append(_to_archive_doc(doc))
+        if doc.get("_id") is not None:
+            ids.append(doc["_id"])
+
+    if archive_docs:
+        calls_archive_collection.insert_many(archive_docs, ordered=False)
+    if not ids:
+        return 0
+    result = calls_collection.delete_many({"_id": {"$in": ids}})
+    return int(result.deleted_count or 0)
+
+
 def load_calls_for_stats(chat_id, extra=None, include_archive=True):
     query = _accepted_query(chat_id, extra or {})
     live_calls = list(calls_collection.find(query))
@@ -1362,8 +1423,9 @@ def load_calls_for_stats(chat_id, extra=None, include_archive=True):
 
 
 def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
-    stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
-    archive_stashed_calls(chat_id, reason="older_call", limit=1000)
+    archived_inactive = archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000)
+    stashed_count = stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
+    archived_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000)
     cutoff = utc_now() - timedelta(days=lookback_days)
     calls = list(
         calls_collection.find(
@@ -1373,6 +1435,8 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
         .limit(limit)
     )
     if not calls:
+        if archived_inactive > 0 or stashed_count > 0 or archived_old > 0:
+            invalidate_groupstats_cache(chat_id)
         return 0
     refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=True)
     invalidate_groupstats_cache(chat_id)
