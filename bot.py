@@ -683,7 +683,7 @@ def derive_user_metrics(calls):
     returns_now = []
     returns_ath = []
     wins = 0
-    profitable_now = 0
+    profitable_peak = 0
     best_x = 0.0
 
     for call in calls:
@@ -704,8 +704,8 @@ def derive_user_metrics(calls):
 
         if x_ath >= WIN_MULTIPLIER:
             wins += 1
-        if x_now > 1.0:
-            profitable_now += 1
+        if x_ath > 1.0:
+            profitable_peak += 1
 
     n = len(returns_now)
     if n == 0:
@@ -723,8 +723,8 @@ def derive_user_metrics(calls):
     avg_now = sum(returns_now) / n
     avg_ath = sum(returns_ath) / n
     win_rate = wins / n
-    profitable_rate = profitable_now / n
-    profitability = clamp((avg_now + 1.0) / 2.0, 0.0, 1.0)
+    profitable_rate = profitable_peak / n
+    profitability = clamp((avg_ath + 1.0) / 2.0, 0.0, 1.0)
     upside_norm = clamp((avg_ath + 1.0) / 3.0, 0.0, 1.0)
     sample_conf = clamp(math.log1p(n) / math.log(25), 0.0, 1.0)
 
@@ -745,7 +745,7 @@ def derive_user_metrics(calls):
         badges.append("Sniper")
     if n >= 10 and win_rate >= 0.60:
         badges.append("High Hit Rate")
-    if n >= 5 and avg_now > 0:
+    if n >= 5 and avg_ath > 0:
         badges.append("Profitable")
 
     return {
@@ -1710,13 +1710,13 @@ async def _fetch_and_calculate_rankings(
         return
 
     if is_bottom:
-        leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"]))
+        leaderboard_data.sort(key=lambda x: (x["avg_now_x"], x["best_x"], x["win_rate"], -x["calls"]))
         title = f"Wall of Shame ({time_text})"
         worst_row = leaderboard_data[0]
         highlight_label = "☠️ Worst Avg"
         highlight_text = f"{format_return(worst_row['avg_now_x'])} by {worst_row['name']}"
     else:
-        leaderboard_data.sort(key=lambda x: (x["score"], x["avg_now_x"], x["calls"]), reverse=True)
+        leaderboard_data.sort(key=lambda x: (x["avg_now_x"], x["best_x"], x["win_rate"], x["calls"]), reverse=True)
         title = f"Yabai Callers ({time_text})"
         highlight_label = "🔥 Best Win"
         highlight_text = best_win_text
