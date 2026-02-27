@@ -2556,6 +2556,54 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(lines))
 
 
+async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat_id = await resolve_target_chat_id(update, context, admin_required=True)
+    if chat_id is None:
+        return
+
+    if not context.args:
+        await msg.reply_text("Usage: /cleardata <Nd|Nh>\nExample: /cleardata 20d")
+        return
+
+    arg = str(context.args[0]).strip().lower()
+    if len(arg) < 2 or arg[-1] not in {"d", "h"}:
+        await msg.reply_text("Invalid window. Use format like 20d or 48h.")
+        return
+
+    try:
+        value = int(arg[:-1])
+    except ValueError:
+        await msg.reply_text("Invalid window. Use format like 20d or 48h.")
+        return
+
+    if value <= 0:
+        await msg.reply_text("Window must be greater than 0.")
+        return
+
+    if arg.endswith("d"):
+        cutoff = utc_now() - timedelta(days=value)
+        window_text = f"{value}d"
+    else:
+        cutoff = utc_now() - timedelta(hours=value)
+        window_text = f"{value}h"
+
+    query = {"chat_id": chat_id, "timestamp": {"$lt": cutoff}}
+    live_deleted = calls_collection.delete_many(query).deleted_count
+    archive_deleted = calls_archive_collection.delete_many(query).deleted_count
+    total_deleted = int(live_deleted or 0) + int(archive_deleted or 0)
+
+    await msg.reply_text(
+        "🧹 DATA CLEAR COMPLETE\n"
+        "────────────────\n"
+        f"Window kept: last {window_text}\n"
+        f"Cutoff: {cutoff.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Deleted live: {live_deleted}\n"
+        f"Deleted archive: {archive_deleted}\n"
+        f"Total deleted: {total_deleted}"
+    )
+
+
 async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, time_arg: str = "7d"):
     fake_context = type("obj", (), {"args": [time_arg]})()
     time_filter, time_text = _resolve_time_filter(fake_context)
@@ -2775,6 +2823,7 @@ def main():
     app.add_handler(CommandHandler("myscore", my_score))
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
+    app.add_handler(CommandHandler("cleardata", clear_data))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
     app.add_handler(CallbackQueryHandler(admin_actions, pattern=r"^admin_"))
