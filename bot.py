@@ -3,6 +3,7 @@ import re
 import math
 import html
 import json
+import time
 import asyncio
 import requests
 import certifi
@@ -41,6 +42,8 @@ RUG_MIN_AGE_HOURS = 12
 ATH_TRACK_WINDOW_DAYS = 7
 ATH_TRACK_MAX_CALLS_PER_CHAT = 800
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
+DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
+DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -53,6 +56,7 @@ settings_collection = db["group_settings"]
 user_profiles_collection = db["user_profiles"]
 
 CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
+_dex_meta_cache = {}
 
 
 def ensure_indexes():
@@ -552,15 +556,41 @@ def get_dexscreener_batch_meta(cas_list):
     if not cas_list:
         return results
 
+    now_ts = time.time()
+    unique_cas = []
+    seen = set()
+    for ca in cas_list:
+        ca_norm = normalize_ca(ca)
+        if not ca_norm or ca_norm in seen:
+            continue
+        seen.add(ca_norm)
+        unique_cas.append(ca_norm)
+
+    to_fetch = []
+    for ca_norm in unique_cas:
+        cached = _dex_meta_cache.get(ca_norm)
+        if cached and cached.get("expires_at", 0) > now_ts:
+            cached_value = cached.get("value")
+            if cached_value:
+                results[ca_norm] = dict(cached_value)
+            continue
+        if cached:
+            _dex_meta_cache.pop(ca_norm, None)
+        to_fetch.append(ca_norm)
+
+    if not to_fetch:
+        return results
+
     def _num(value):
         try:
             return float(value or 0)
         except (TypeError, ValueError):
             return 0.0
 
-    for i in range(0, len(cas_list), 30):
-        chunk = cas_list[i:i + 30]
+    for i in range(0, len(to_fetch), 30):
+        chunk = to_fetch[i:i + 30]
         url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
+        chunk_map = {}
         try:
             response = requests.get(url, timeout=10)
             response.raise_for_status()
@@ -577,9 +607,9 @@ def get_dexscreener_batch_meta(cas_list):
                     if address and metric > 0:
                         addr_lower = address.lower()
                         score = (liquidity_usd, volume_h24, metric)
-                        prev = results.get(addr_lower)
+                        prev = chunk_map.get(addr_lower)
                         if not prev or score > prev["_score"]:
-                            results[addr_lower] = {
+                            chunk_map[addr_lower] = {
                                 "fdv": float(metric),
                                 "symbol": symbol.upper() if symbol else "",
                                 "volume_h24": float(volume_h24),
@@ -587,8 +617,26 @@ def get_dexscreener_batch_meta(cas_list):
                             }
         except Exception as exc:
             print(f"DexScreener batch fetch error: {exc}")
-    for address in list(results.keys()):
-        results[address].pop("_score", None)
+
+        expires_at = time.time() + DEX_CACHE_TTL_SECONDS
+        for ca_norm in chunk:
+            value = chunk_map.get(ca_norm)
+            if value:
+                value = dict(value)
+                value.pop("_score", None)
+                results[ca_norm] = value
+                _dex_meta_cache[ca_norm] = {"value": value, "expires_at": expires_at}
+            else:
+                # Cache misses briefly to suppress repeated lookups for dead/invalid CAs.
+                _dex_meta_cache[ca_norm] = {"value": None, "expires_at": expires_at}
+
+    if len(_dex_meta_cache) > DEX_CACHE_MAX_ENTRIES:
+        stale_keys = [key for key, entry in _dex_meta_cache.items() if entry.get("expires_at", 0) <= now_ts]
+        for key in stale_keys:
+            _dex_meta_cache.pop(key, None)
+        while len(_dex_meta_cache) > DEX_CACHE_MAX_ENTRIES:
+            _dex_meta_cache.pop(next(iter(_dex_meta_cache)), None)
+
     return results
 
 
@@ -1146,7 +1194,7 @@ def build_daily_digest(chat_id, since_ts, digest_data=None):
     return "\n".join(lines)
 
 
-def generate_daily_digest_card(digest_data):
+def generate_daily_digest_card(digest_data, group_avatar_image=None):
     width, height = 1200, 440
     card = Image.new("RGB", (width, height), (14, 22, 38))
     draw_vertical_gradient(card, (21, 27, 54), (34, 48, 86))
@@ -1188,6 +1236,15 @@ def generate_daily_digest_card(digest_data):
     else:
         draw.text((right_x, 228), "N/A", font=stat_font, fill=(255, 255, 255))
 
+    group_avatar = build_circle_avatar(group_avatar_image, 84) if group_avatar_image is not None else None
+    if group_avatar is not None:
+        icon_x, icon_y = 1064, 46
+        card_rgba = card.convert("RGBA")
+        card_rgba.alpha_composite(group_avatar, (icon_x, icon_y))
+        ring = ImageDraw.Draw(card_rgba)
+        ring.ellipse((icon_x - 3, icon_y - 3, icon_x + 86, icon_y + 86), outline=(145, 174, 235, 210), width=3)
+        card = card_rgba.convert("RGB")
+
     buffer = BytesIO()
     card.save(buffer, format="PNG", optimize=True)
     buffer.seek(0)
@@ -1211,7 +1268,8 @@ async def send_daily_digest(bot, chat_id, manual=False):
     digest_text = build_daily_digest(chat_id, now - timedelta(hours=24), digest_data=digest_data)
 
     if digest_data["has_calls"]:
-        digest_card = generate_daily_digest_card(digest_data)
+        group_avatar_image = await fetch_chat_avatar_image(bot, chat_id)
+        digest_card = generate_daily_digest_card(digest_data, group_avatar_image=group_avatar_image)
         digest_caption = digest_text if len(digest_text) <= 1024 else (digest_text[:1021] + "...")
         await bot.send_photo(
             chat_id=chat_id,
