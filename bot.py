@@ -41,6 +41,7 @@ RUG_CURRENT_MAX_X = 0.30
 RUG_MIN_AGE_HOURS = 12
 ATH_TRACK_WINDOW_DAYS = 7
 ATH_TRACK_MAX_CALLS_PER_CHAT = 800
+HEARTBEAT_CALLS_PER_CALLER = 3
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
@@ -955,7 +956,44 @@ def _accepted_query(chat_id, extra=None):
     return query
 
 
+def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER):
+    active_calls = list(
+        calls_collection.find(
+            _accepted_query(chat_id, {"is_stashed": {"$ne": True}})
+        ).sort("timestamp", -1)
+    )
+    if not active_calls:
+        return 0
+
+    now = utc_now()
+    seen_per_caller = {}
+    to_stash_ids = []
+    for call in active_calls:
+        key = get_caller_key(call)
+        seen = seen_per_caller.get(key, 0)
+        if seen < keep_latest:
+            seen_per_caller[key] = seen + 1
+            continue
+        to_stash_ids.append(call["_id"])
+
+    if not to_stash_ids:
+        return 0
+
+    result = calls_collection.update_many(
+        {"_id": {"$in": to_stash_ids}},
+        {
+            "$set": {
+                "is_stashed": True,
+                "stashed_reason": "older_call",
+                "stashed_at": now,
+            }
+        },
+    )
+    return int(result.modified_count or 0)
+
+
 def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
+    stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
     cutoff = utc_now() - timedelta(days=lookback_days)
     calls = list(
         calls_collection.find(
@@ -1642,6 +1680,129 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
     return updated
 
 
+def fetch_best_win_text(chat_id, time_filter):
+    match_query = {**accepted_call_filter(chat_id), **(time_filter or {})}
+    pipeline = [
+        {"$match": match_query},
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+            }
+        },
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {
+            "$addFields": {
+                "_x_peak": {
+                    "$cond": [
+                        {"$gt": ["$_initial", 0]},
+                        {"$divide": ["$_peak", "$_initial"]},
+                        0,
+                    ]
+                }
+            }
+        },
+        {"$sort": {"_x_peak": -1}},
+        {"$limit": 1},
+    ]
+    rows = list(calls_collection.aggregate(pipeline))
+    if not rows:
+        return "N/A"
+    row = rows[0]
+    initial = float(row.get("initial_mcap", 1) or 1)
+    ath = float(row.get("ath_mcap", initial) or initial)
+    current = float(row.get("current_mcap", initial) or initial)
+    best_x = max(ath, current) / max(initial, 1.0)
+    token = token_label(row.get("token_symbol", ""), row.get("ca", ""))
+    return f"{format_return(best_x)} by {row.get('caller_name', 'Unknown')} ({token})"
+
+
+def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_per_page):
+    match_query = {**accepted_call_filter(chat_id), **(time_filter or {})}
+    skip_rows = max(0, int(page)) * max(1, int(items_per_page))
+
+    group_pipeline = [
+        {"$match": match_query},
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+                "_name": {"$ifNull": ["$caller_name", "Unknown"]},
+            }
+        },
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {
+            "$addFields": {
+                "_x_peak": {
+                    "$cond": [
+                        {"$gt": ["$_initial", 0]},
+                        {"$divide": ["$_peak", "$_initial"]},
+                        0,
+                    ]
+                },
+                "_caller_key": {
+                    "$cond": [
+                        {"$ne": ["$caller_id", None]},
+                        {"$concat": ["id:", {"$toString": "$caller_id"}]},
+                        {"$concat": ["legacy:", {"$toLower": "$_name"}]},
+                    ]
+                },
+            }
+        },
+        {"$match": {"_x_peak": {"$gt": 0}}},
+        {
+            "$group": {
+                "_id": "$_caller_key",
+                "caller_id": {"$first": "$caller_id"},
+                "name": {"$first": "$_name"},
+                "calls": {"$sum": 1},
+                "avg_now_x": {"$avg": "$_x_peak"},
+                "best_x": {"$max": "$_x_peak"},
+                "wins": {"$sum": {"$cond": [{"$gte": ["$_x_peak", WIN_MULTIPLIER]}, 1, 0]}},
+                "profit": {"$sum": {"$cond": [{"$gt": ["$_x_peak", 1]}, 1, 0]}},
+            }
+        },
+        {"$match": {"calls": {"$gte": MIN_CALLS_REQUIRED}}},
+        {
+            "$project": {
+                "_id": 0,
+                "caller_id": 1,
+                "name": 1,
+                "calls": 1,
+                "avg_now_x": 1,
+                "best_x": 1,
+                "win_rate": {
+                    "$multiply": [
+                        {"$cond": [{"$gt": ["$calls", 0]}, {"$divide": ["$wins", "$calls"]}, 0]},
+                        100,
+                    ]
+                },
+                "profitable_rate": {
+                    "$multiply": [
+                        {"$cond": [{"$gt": ["$calls", 0]}, {"$divide": ["$profit", "$calls"]}, 0]},
+                        100,
+                    ]
+                },
+            }
+        },
+    ]
+
+    count_pipeline = group_pipeline + [{"$count": "total"}]
+    count_rows = list(calls_collection.aggregate(count_pipeline))
+    total = int(count_rows[0]["total"]) if count_rows else 0
+
+    sort_stage = (
+        {"$sort": {"avg_now_x": 1, "best_x": 1, "win_rate": 1, "calls": -1}}
+        if is_bottom
+        else {"$sort": {"avg_now_x": -1, "best_x": -1, "win_rate": -1, "calls": -1}}
+    )
+    page_pipeline = group_pipeline + [sort_stage, {"$skip": skip_rows}, {"$limit": max(1, int(items_per_page))}]
+    rows = list(calls_collection.aggregate(page_pipeline))
+    return rows, total
+
+
 async def _fetch_and_calculate_rankings(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -1649,87 +1810,44 @@ async def _fetch_and_calculate_rankings(
     target_chat_id=None,
 ):
     chat_id = int(target_chat_id) if target_chat_id is not None else update.effective_chat.id
-    base_filter = accepted_call_filter(chat_id)
     time_filter, time_text = _resolve_time_filter(context)
-    query = {**base_filter, **time_filter}
-
-    all_calls = list(calls_collection.find(query))
-    if not all_calls:
-        await update.effective_message.reply_text(f"No data for {time_text} in this group")
-        return
-
-    refresh_calls_market_data(all_calls)
-    best_win_text = "N/A"
-    best_call = max(
-        all_calls,
-        key=lambda c: (float(c.get("ath_mcap", 0) or 0) / float(c.get("initial_mcap", 1) or 1)),
-        default=None,
+    first_page_rows, total_ranked = fetch_ranked_leaderboard_page(
+        chat_id=chat_id,
+        time_filter=time_filter,
+        is_bottom=is_bottom,
+        page=0,
+        items_per_page=6,
     )
-    if best_call:
-        initial = float(best_call.get("initial_mcap", 1) or 1)
-        best_x = float(max(best_call.get("ath_mcap", initial) or initial, best_call.get("current_mcap", initial) or initial)) / initial
-        ca = best_call.get("ca", "")
-        token = token_label(best_call.get("token_symbol", ""), ca)
-        best_win_text = f"{format_return(best_x)} by {best_call.get('caller_name', 'Unknown')} ({token})"
-
-    user_calls = {}
-    for call in all_calls:
-        caller_key = get_caller_key(call)
-        user_calls.setdefault(caller_key, []).append(call)
-
-    leaderboard_data = []
-    for caller_key, calls in user_calls.items():
-        metrics = derive_user_metrics(calls)
-        if metrics["calls"] < MIN_CALLS_REQUIRED:
-            continue
-
-        caller_id = calls[0].get("caller_id")
-        caller_name = calls[0].get("caller_name", "Unknown")
-        penalty = get_reputation_penalty(chat_id, caller_id)
-        score = max(0.0, metrics["reputation"] - penalty)
-
-        leaderboard_data.append(
-            {
-                "caller_key": caller_key,
-                "caller_id": caller_id,
-                "name": caller_name,
-                "calls": metrics["calls"],
-                "avg_ath_x": 1.0 + metrics["avg_ath"],
-                "avg_now_x": 1.0 + metrics["avg_ath"],
-                "best_x": metrics["best_x"],
-                "win_rate": metrics["win_rate"] * 100,
-                "profitable_rate": metrics["profitable_rate"] * 100,
-                "score": score,
-            }
-        )
-
-    if not leaderboard_data:
+    if total_ranked <= 0 or not first_page_rows:
         await update.effective_message.reply_text(
             f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked"
         )
         return
 
+    best_win_text = fetch_best_win_text(chat_id, time_filter)
+
     if is_bottom:
-        leaderboard_data.sort(key=lambda x: (x["avg_now_x"], x["best_x"], x["win_rate"], -x["calls"]))
         title = f"Wall of Shame ({time_text})"
-        worst_row = leaderboard_data[0]
+        worst_row = first_page_rows[0]
         highlight_label = "☠️ Worst Avg"
         highlight_text = f"{format_return(worst_row['avg_now_x'])} by {worst_row['name']}"
     else:
-        leaderboard_data.sort(key=lambda x: (x["avg_now_x"], x["best_x"], x["win_rate"], x["calls"]), reverse=True)
         title = f"Yabai Callers ({time_text})"
         highlight_label = "🔥 Best Win"
         highlight_text = best_win_text
 
+    context.chat_data["leaderboard_chat_id"] = chat_id
+    context.chat_data["leaderboard_time_filter"] = time_filter
+    context.chat_data["leaderboard_is_bottom"] = bool(is_bottom)
     context.chat_data["leaderboard_title"] = title
-    context.chat_data["leaderboard_data"] = leaderboard_data
+    context.chat_data["leaderboard_total"] = total_ranked
     context.chat_data["leaderboard_highlight_label"] = highlight_label
     context.chat_data["leaderboard_highlight_text"] = highlight_text
     context.chat_data["leaderboard_image_mode"] = False
 
     try:
         group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
-        top = leaderboard_data[0]
+        top = first_page_rows[0]
         spotlight = generate_leaderboard_spotlight_card(
             title=ascii_safe(title, fallback="Yabai Leaderboard"),
             top_name=ascii_safe(top["name"], fallback="Top Caller"),
@@ -1771,17 +1889,29 @@ async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def build_leaderboard_page(context, page=0):
-    data = context.chat_data.get("leaderboard_data", [])
+    chat_id = context.chat_data.get("leaderboard_chat_id")
+    time_filter = context.chat_data.get("leaderboard_time_filter", {}) or {}
+    is_bottom = bool(context.chat_data.get("leaderboard_is_bottom", False))
     title = context.chat_data.get("leaderboard_title", "Leaderboard")
     highlight_label = context.chat_data.get("leaderboard_highlight_label", "🔥 Best Win")
     highlight_text = context.chat_data.get("leaderboard_highlight_text", "N/A")
     image_mode = bool(context.chat_data.get("leaderboard_image_mode", False))
     items_per_page = 6 if image_mode else 10
-    total_pages = max(1, math.ceil(len(data) / items_per_page))
+    if chat_id is None:
+        return "Data expired. Run the command again.", None
 
+    total_ranked = int(context.chat_data.get("leaderboard_total", 0) or 0)
+    total_pages = max(1, math.ceil(max(0, total_ranked) / items_per_page))
+    page = max(0, min(int(page or 0), total_pages - 1))
+
+    page_data, _ = fetch_ranked_leaderboard_page(
+        chat_id=chat_id,
+        time_filter=time_filter,
+        is_bottom=is_bottom,
+        page=page,
+        items_per_page=items_per_page,
+    )
     start_idx = page * items_per_page
-    end_idx = start_idx + items_per_page
-    page_data = data[start_idx:end_idx]
 
     lines = [
         f"🏆 {title.upper()}",
