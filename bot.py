@@ -529,6 +529,12 @@ def get_dexscreener_batch_meta(cas_list):
     if not cas_list:
         return results
 
+    def _num(value):
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
     for i in range(0, len(cas_list), 30):
         chunk = cas_list[i:i + 30]
         url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
@@ -540,16 +546,25 @@ def get_dexscreener_batch_meta(cas_list):
                 for pair in payload["pairs"]:
                     address = pair.get("baseToken", {}).get("address")
                     symbol = pair.get("baseToken", {}).get("symbol") or ""
-                    fdv = pair.get("fdv", 0)
-                    if address and fdv and fdv > 0:
+                    liquidity_usd = _num((pair.get("liquidity") or {}).get("usd"))
+                    volume_h24 = _num((pair.get("volume") or {}).get("h24"))
+                    market_cap = _num(pair.get("marketCap"))
+                    fdv = _num(pair.get("fdv"))
+                    metric = market_cap if market_cap > 0 else fdv
+                    if address and metric > 0:
                         addr_lower = address.lower()
-                        if addr_lower not in results or fdv > results[addr_lower]["fdv"]:
+                        score = (liquidity_usd, volume_h24, metric)
+                        prev = results.get(addr_lower)
+                        if not prev or score > prev["_score"]:
                             results[addr_lower] = {
-                                "fdv": float(fdv),
+                                "fdv": float(metric),
                                 "symbol": symbol.upper() if symbol else "",
+                                "_score": score,
                             }
         except Exception as exc:
             print(f"DexScreener batch fetch error: {exc}")
+    for address in list(results.keys()):
+        results[address].pop("_score", None)
     return results
 
 
