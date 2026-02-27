@@ -45,6 +45,8 @@ HEARTBEAT_CALLS_PER_CALLER = 3
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
+GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
+CHAT_AVATAR_CACHE_TTL_SECONDS = max(60, int(os.getenv("CHAT_AVATAR_CACHE_TTL_SECONDS", "3600")))
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -62,6 +64,8 @@ CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
 _dex_meta_cache = {}
 _ops_runtime = {"by_chat": {}}
 _leaderboard_sessions = {}
+_groupstats_cache = {}
+_chat_avatar_cache = {}
 
 
 def ensure_indexes():
@@ -963,6 +967,26 @@ async def fetch_chat_avatar_image(bot, chat_id):
         return None
 
 
+async def fetch_chat_avatar_image_cached(bot, chat_id):
+    now_ts = time.time()
+    cached = _chat_avatar_cache.get(chat_id)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return cached.get("image")
+
+    image = await fetch_chat_avatar_image(bot, chat_id)
+    _chat_avatar_cache[chat_id] = {
+        "image": image,
+        "expires_at": now_ts + CHAT_AVATAR_CACHE_TTL_SECONDS,
+    }
+    if len(_chat_avatar_cache) > 200:
+        stale_keys = [key for key, row in _chat_avatar_cache.items() if row.get("expires_at", 0) <= now_ts]
+        for key in stale_keys:
+            _chat_avatar_cache.pop(key, None)
+        while len(_chat_avatar_cache) > 200:
+            _chat_avatar_cache.pop(next(iter(_chat_avatar_cache)), None)
+    return image
+
+
 def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
     now = utc_now()
     by_chat = _ops_runtime.setdefault("by_chat", {})
@@ -1047,6 +1071,171 @@ def snapshot_leaderboard_state(context):
         "leaderboard_image_mode",
     ]
     return {key: context.chat_data.get(key) for key in keys}
+
+
+def _groupstats_cache_key(chat_id, time_arg):
+    return int(chat_id), str(time_arg or "all").strip().lower()
+
+
+def get_groupstats_cache(chat_id, time_arg):
+    now_ts = time.time()
+    key = _groupstats_cache_key(chat_id, time_arg)
+    row = _groupstats_cache.get(key)
+    if not row:
+        return None
+    if row.get("expires_at", 0) <= now_ts:
+        _groupstats_cache.pop(key, None)
+        return None
+    return row.get("value")
+
+
+def set_groupstats_cache(chat_id, time_arg, value):
+    now_ts = time.time()
+    key = _groupstats_cache_key(chat_id, time_arg)
+    _groupstats_cache[key] = {
+        "value": value,
+        "expires_at": now_ts + GROUPSTATS_CACHE_TTL_SECONDS,
+    }
+    if len(_groupstats_cache) > 400:
+        stale = [k for k, row in _groupstats_cache.items() if row.get("expires_at", 0) <= now_ts]
+        for k in stale:
+            _groupstats_cache.pop(k, None)
+        while len(_groupstats_cache) > 400:
+            _groupstats_cache.pop(next(iter(_groupstats_cache)), None)
+
+
+def invalidate_groupstats_cache(chat_id):
+    target = int(chat_id)
+    keys = [k for k in _groupstats_cache.keys() if int(k[0]) == target]
+    for k in keys:
+        _groupstats_cache.pop(k, None)
+
+
+def compute_group_stats_snapshot(chat_id, time_filter):
+    match_query = {**accepted_call_filter(chat_id), **(time_filter or {})}
+    pipeline = [
+        {"$match": match_query},
+        {
+            "$project": {
+                "caller_id": 1,
+                "caller_name": 1,
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+                "token_symbol": 1,
+                "ca": 1,
+                "ca_norm": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "token_calls_archive",
+                "pipeline": [
+                    {"$match": match_query},
+                    {
+                        "$project": {
+                            "caller_id": 1,
+                            "caller_name": 1,
+                            "initial_mcap": 1,
+                            "ath_mcap": 1,
+                            "current_mcap": 1,
+                            "token_symbol": 1,
+                            "ca": "$ca_norm",
+                            "ca_norm": 1,
+                        }
+                    },
+                ],
+            }
+        },
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+                "_caller_name": {"$ifNull": ["$caller_name", "Unknown"]},
+            }
+        },
+        {"$match": {"_initial": {"$gt": 0}}},
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {
+            "$addFields": {
+                "_x_peak": {"$divide": ["$_peak", "$_initial"]},
+                "_caller_key": {
+                    "$cond": [
+                        {"$ne": ["$caller_id", None]},
+                        {"$concat": ["id:", {"$toString": "$caller_id"}]},
+                        {"$concat": ["legacy:", {"$toLower": "$_caller_name"}]},
+                    ]
+                },
+            }
+        },
+        {
+            "$facet": {
+                "metrics": [
+                    {
+                        "$group": {
+                            "_id": None,
+                            "total_calls": {"$sum": 1},
+                            "unique_callers": {"$addToSet": "$_caller_key"},
+                            "wins": {"$sum": {"$cond": [{"$gte": ["$_x_peak", WIN_MULTIPLIER]}, 1, 0]}},
+                            "avg_x": {"$avg": "$_x_peak"},
+                        }
+                    }
+                ],
+                "best": [
+                    {"$sort": {"_x_peak": -1}},
+                    {"$limit": 1},
+                    {
+                        "$project": {
+                            "_id": 0,
+                            "caller_name": "$_caller_name",
+                            "x_peak": "$_x_peak",
+                            "token_symbol": 1,
+                            "ca": 1,
+                            "ca_norm": 1,
+                        }
+                    },
+                ],
+            }
+        },
+    ]
+
+    rows = list(calls_collection.aggregate(pipeline, allowDiskUse=True))
+    if not rows:
+        return None
+    row = rows[0] or {}
+    metrics_rows = row.get("metrics") or []
+    if not metrics_rows:
+        return None
+
+    m = metrics_rows[0] or {}
+    total_calls = int(m.get("total_calls", 0) or 0)
+    if total_calls <= 0:
+        return None
+    unique_callers = len(m.get("unique_callers") or [])
+    wins = int(m.get("wins", 0) or 0)
+    avg_x = float(m.get("avg_x", 1.0) or 1.0)
+    win_rate = (wins / total_calls) if total_calls > 0 else 0.0
+
+    best_row = (row.get("best") or [None])[0]
+    if best_row:
+        best_ca = best_row.get("ca") or best_row.get("ca_norm") or ""
+        best = {
+            "best_x": float(best_row.get("x_peak", 0) or 0),
+            "caller_name": str(best_row.get("caller_name") or "Unknown"),
+            "token_symbol": str(best_row.get("token_symbol") or ""),
+            "ca": str(best_ca),
+        }
+    else:
+        best = None
+
+    return {
+        "total_calls": total_calls,
+        "unique_callers": unique_callers,
+        "win_rate": float(win_rate),
+        "avg_x": float(avg_x),
+        "best": best,
+    }
 
 
 def _accepted_query(chat_id, extra=None):
@@ -1153,6 +1342,7 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
     if not calls:
         return 0
     refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=True)
+    invalidate_groupstats_cache(chat_id)
     return len(calls)
 
 
@@ -1162,6 +1352,7 @@ def refresh_all_call_peaks(chat_id):
         return {"calls": 0, "tokens": 0, "updated": 0}
     tokens = len({call.get("ca_norm", normalize_ca(call.get("ca", ""))) for call in calls if call.get("ca")})
     updated = refresh_calls_market_data(calls, include_stashed=True, apply_stash_policy=True)
+    invalidate_groupstats_cache(chat_id)
     return {"calls": len(calls), "tokens": tokens, "updated": updated}
 
 
@@ -1514,7 +1705,7 @@ async def send_daily_digest(bot, chat_id, manual=False):
     digest_text = build_daily_digest(chat_id, now - timedelta(hours=24), digest_data=digest_data)
 
     if digest_data["has_calls"]:
-        group_avatar_image = await fetch_chat_avatar_image(bot, chat_id)
+        group_avatar_image = await fetch_chat_avatar_image_cached(bot, chat_id)
         digest_card = generate_daily_digest_card(digest_data, group_avatar_image=group_avatar_image)
         digest_caption = digest_text if len(digest_text) <= 1024 else (digest_text[:1021] + "...")
         await bot.send_photo(
@@ -1746,6 +1937,8 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 call_data["stashed_at"] = now
             calls_collection.insert_one(call_data)
             update_user_profile(chat_id, user, "accepted")
+
+    invalidate_groupstats_cache(chat_id)
 
 
 def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
@@ -2054,7 +2247,7 @@ async def _fetch_and_calculate_rankings(
     context.chat_data["leaderboard_image_mode"] = False
 
     try:
-        group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
+        group_avatar_image = await fetch_chat_avatar_image_cached(context.bot, chat_id)
         top = first_page_rows[0]
         spotlight = generate_leaderboard_spotlight_card(
             title=ascii_safe(title, fallback="Yabai Leaderboard"),
@@ -2459,55 +2652,50 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
-    status_message = await update.effective_message.reply_text("Analyzing group performance...")
+
     time_filter, time_text = _resolve_time_filter(context)
-    live_calls, archived_calls, all_calls = load_calls_for_stats(chat_id, time_filter, include_archive=True)
-    if not all_calls:
-        try:
-            await status_message.delete()
-        except Exception:
-            pass
+    time_arg_key = context.args[0].lower() if context.args else "all"
+    snapshot = get_groupstats_cache(chat_id, time_arg_key)
+    if snapshot is None:
+        snapshot = compute_group_stats_snapshot(chat_id, time_filter)
+        if snapshot is not None:
+            set_groupstats_cache(chat_id, time_arg_key, snapshot)
+
+    if not snapshot:
         await update.effective_message.reply_text(
             f"No calls tracked in this group for {time_text}",
             reply_markup=delete_button_markup(requester_id),
         )
         return
 
-    refresh_calls_market_data(live_calls)
-
-    total_calls = len(all_calls)
-    unique_callers = set(get_caller_key(call) for call in all_calls)
-
-    group_metrics = derive_user_metrics(all_calls)
-
-    best_call = max(
-        all_calls,
-        key=lambda c: (float(c.get("ath_mcap", 0) or 0) / float(c.get("initial_mcap", 1) or 1)),
-        default=None,
-    )
+    total_calls = int(snapshot.get("total_calls", 0) or 0)
+    callers_count = int(snapshot.get("unique_callers", 0) or 0)
+    win_rate = float(snapshot.get("win_rate", 0.0) or 0.0)
+    avg_x = float(snapshot.get("avg_x", 1.0) or 1.0)
+    best = snapshot.get("best")
 
     best_text = "N/A"
     best_caller = "N/A"
-    if best_call:
-        initial = float(best_call.get("initial_mcap", 1) or 1)
-        best_x = float(best_call.get("ath_mcap", initial) or initial) / initial
-        ca = best_call.get("ca", "")
-        ca_norm = best_call.get("ca_norm", normalize_ca(ca))
-        best_meta = get_dexscreener_batch_meta([ca_norm]).get(ca_norm, {})
-        symbol = best_meta.get("symbol") or best_call.get("token_symbol", "")
-        token = token_label(symbol, ca)
-        best_caller = best_call.get("caller_name", "Unknown")
+    if best:
+        best_x = float(best.get("best_x", 0) or 0)
+        best_caller = str(best.get("caller_name") or "Unknown")
+        best_ca = str(best.get("ca") or "")
+        best_symbol = str(best.get("token_symbol") or "")
+        best_token = token_label(best_symbol, best_ca)
         best_text = format_return(best_x)
-        best_by_text = f"   └ By {html.escape(best_caller)} ({html.escape(token)})\n   <code>{html.escape(ca)}</code>"
+        if best_ca:
+            best_by_text = f"   └ By {html.escape(best_caller)} ({html.escape(best_token)})\n   <code>{html.escape(best_ca)}</code>"
+        else:
+            best_by_text = f"   └ By {html.escape(best_caller)} ({html.escape(best_token)})"
     else:
         best_by_text = "   └ By N/A"
 
     text = (
         f"📊 Group Performance ({time_text.upper()})\n"
         f"────────────────\n"
-        f"👥 Callers: {len(unique_callers)} | 📞 Calls: {total_calls}\n"
-        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {group_metrics['win_rate'] * 100:.1f}%\n"
-        f"📈 Group Avg: {format_return(1 + group_metrics['avg_ath'])}\n"
+        f"👥 Callers: {callers_count} | 📞 Calls: {total_calls}\n"
+        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_rate * 100:.1f}%\n"
+        f"📈 Group Avg: {format_return(avg_x)}\n"
         f"🔥 Best Call: {best_text}\n"
         f"{best_by_text}"
     )
@@ -2516,23 +2704,18 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_group:{chat_id}")]]
     )
     reply_markup = with_delete_button(reply_markup, requester_id)
-    group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
+    group_avatar_image = await fetch_chat_avatar_image_cached(context.bot, chat_id)
 
     card_image = generate_group_stats_card(
         time_text=time_text,
-        callers_count=len(unique_callers),
+        callers_count=callers_count,
         total_calls=total_calls,
-        win_rate_pct=group_metrics["win_rate"] * 100,
-        avg_text=format_return(1 + group_metrics["avg_ath"]),
+        win_rate_pct=win_rate * 100,
+        avg_text=format_return(avg_x),
         best_text=best_text,
         best_caller=best_caller,
         group_avatar_image=group_avatar_image,
     )
-
-    try:
-        await status_message.delete()
-    except Exception:
-        pass
 
     await update.effective_message.reply_photo(
         photo=card_image,
@@ -2770,6 +2953,7 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_deleted = calls_collection.delete_many(query).deleted_count
     archive_deleted = calls_archive_collection.delete_many(query).deleted_count
     total_deleted = int(live_deleted or 0) + int(archive_deleted or 0)
+    invalidate_groupstats_cache(chat_id)
 
     await msg.reply_text(
         "🧹 DATA CLEAR COMPLETE\n"
