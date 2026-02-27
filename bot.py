@@ -44,6 +44,7 @@ ATH_TRACK_MAX_CALLS_PER_CHAT = 800
 HEARTBEAT_CALLS_PER_CALLER = 2
 INACTIVE_CALLER_ARCHIVE_HOURS = 24
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
+LOW_VOLUME_LOOKBACK = "h1"
 LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS = max(1, int(os.getenv("LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS", "3")))
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
@@ -640,6 +641,7 @@ def get_dexscreener_batch_meta(cas_list):
                     address = pair.get("baseToken", {}).get("address")
                     symbol = pair.get("baseToken", {}).get("symbol") or ""
                     liquidity_usd = _num((pair.get("liquidity") or {}).get("usd"))
+                    volume_h1 = _num((pair.get("volume") or {}).get("h1"))
                     volume_h24 = _num((pair.get("volume") or {}).get("h24"))
                     market_cap = _num(pair.get("marketCap"))
                     fdv = _num(pair.get("fdv"))
@@ -652,6 +654,7 @@ def get_dexscreener_batch_meta(cas_list):
                             chunk_map[addr_lower] = {
                                 "fdv": float(metric),
                                 "symbol": symbol.upper() if symbol else "",
+                                "volume_h1": float(volume_h1),
                                 "volume_h24": float(volume_h24),
                                 "_score": score,
                             }
@@ -1483,11 +1486,13 @@ def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
         mcap = float(token_meta.get("fdv", 0) or 0)
         if mcap <= 0:
             continue
+        volume_h1 = float(token_meta.get("volume_h1", token_meta.get("volume_h24", 0)) or 0)
         volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
 
         update_doc = {
             "$set": {
                 "current_mcap": mcap,
+                "volume_h1": volume_h1,
                 "volume_h24": volume_h24,
                 "last_market_refresh_at": now,
             },
@@ -2025,8 +2030,9 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token_meta = batch_data.get(ca_norm, {})
         mcap = token_meta.get("fdv")
         symbol = token_meta.get("symbol", "")
+        volume_h1 = float(token_meta.get("volume_h1", token_meta.get("volume_h24", 0)) or 0)
         volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
-        is_stashed = volume_h24 < LOW_VOLUME_STASH_THRESHOLD
+        is_stashed = volume_h1 < LOW_VOLUME_STASH_THRESHOLD
 
         if mcap and mcap > 0:
             call_data = {
@@ -2041,6 +2047,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "ath_mcap": mcap,
                 "current_mcap": mcap,
                 "token_symbol": symbol,
+                "volume_h1": volume_h1,
                 "volume_h24": volume_h24,
                 "is_stashed": is_stashed,
                 "timestamp": now,
@@ -2104,10 +2111,17 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
         if not current_mcap:
             continue
         ath = max(float(call.get("ath_mcap", current_mcap)), float(current_mcap))
+        volume_h1 = float(
+            meta.get(
+                "volume_h1",
+                call.get("volume_h1", call.get("volume_h24", 0)),
+            ) or 0
+        )
         volume_h24 = float(meta.get("volume_h24", call.get("volume_h24", 0)) or 0)
         update_fields = {
             "current_mcap": current_mcap,
             "ath_mcap": ath,
+            "volume_h1": volume_h1,
             "volume_h24": volume_h24,
             "last_market_refresh_at": now,
         }
@@ -2115,7 +2129,7 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
         if meta.get("symbol"):
             update_fields["token_symbol"] = meta["symbol"]
         if apply_stash_policy:
-            if volume_h24 < LOW_VOLUME_STASH_THRESHOLD:
+            if volume_h1 < LOW_VOLUME_STASH_THRESHOLD:
                 update_fields["is_stashed"] = True
                 update_fields["stashed_reason"] = "low_volume"
                 update_fields["stashed_at"] = now
@@ -2131,11 +2145,12 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
         updated += int(result.modified_count or 0)
         call["current_mcap"] = current_mcap
         call["ath_mcap"] = ath
+        call["volume_h1"] = volume_h1
         call["volume_h24"] = volume_h24
         if meta.get("symbol"):
             call["token_symbol"] = meta["symbol"]
         if apply_stash_policy:
-            call["is_stashed"] = volume_h24 < LOW_VOLUME_STASH_THRESHOLD
+            call["is_stashed"] = volume_h1 < LOW_VOLUME_STASH_THRESHOLD
     return updated
 
 
