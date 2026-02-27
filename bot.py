@@ -59,6 +59,7 @@ db = client["yabai_crypto_bot"]
 
 calls_collection = db["token_calls"]
 calls_archive_collection = db["token_calls_archive"]
+caller_rollups_collection = db["caller_rollups"]
 settings_collection = db["group_settings"]
 user_profiles_collection = db["user_profiles"]
 private_links_collection = db["private_links"]
@@ -70,6 +71,7 @@ _leaderboard_sessions = {}
 _groupstats_cache = {}
 _groupstats_media_cache = {}
 _chat_avatar_cache = {}
+ROLLUP_SCHEMA_VERSION = 1
 
 
 def ensure_indexes():
@@ -85,6 +87,8 @@ def ensure_indexes():
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("ca_norm", ASCENDING)])
+    caller_rollups_collection.create_index([("chat_id", ASCENDING), ("caller_key", ASCENDING)], unique=True)
+    caller_rollups_collection.create_index([("chat_id", ASCENDING), ("avg_x", DESCENDING), ("calls", DESCENDING)])
 
     user_profiles_collection.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
     settings_collection.create_index([("chat_id", ASCENDING)], unique=True)
@@ -868,6 +872,258 @@ def get_caller_key(call_doc):
     return f"legacy:{legacy_name}"
 
 
+def call_peak_x(call_doc):
+    initial = float(call_doc.get("initial_mcap", 0) or 0)
+    if initial <= 0:
+        return 0.0
+    current = float(call_doc.get("current_mcap", initial) or initial)
+    ath = float(call_doc.get("ath_mcap", initial) or initial)
+    return max(ath, current) / initial
+
+
+def _refresh_rollup_rates(chat_id, caller_key):
+    caller_rollups_collection.update_one(
+        {"chat_id": chat_id, "caller_key": caller_key},
+        [
+            {
+                "$set": {
+                    "avg_x": {
+                        "$cond": [
+                            {"$gt": ["$calls", 0]},
+                            {"$divide": ["$sum_x_peak", "$calls"]},
+                            0,
+                        ]
+                    },
+                    "win_rate": {
+                        "$multiply": [
+                            100,
+                            {
+                                "$cond": [
+                                    {"$gt": ["$calls", 0]},
+                                    {"$divide": ["$wins", "$calls"]},
+                                    0,
+                                ]
+                            },
+                        ]
+                    },
+                    "profitable_rate": {
+                        "$multiply": [
+                            100,
+                            {
+                                "$cond": [
+                                    {"$gt": ["$calls", 0]},
+                                    {"$divide": ["$profitables", "$calls"]},
+                                    0,
+                                ]
+                            },
+                        ]
+                    },
+                }
+            }
+        ],
+    )
+
+
+def apply_rollup_delta(
+    chat_id,
+    caller_id,
+    caller_name,
+    caller_key,
+    delta_calls=0,
+    delta_wins=0,
+    delta_profitables=0,
+    delta_sum_x_peak=0.0,
+    best_x_candidate=0.0,
+):
+    if not caller_key:
+        return
+    now = utc_now()
+    update_doc = {
+        "$set": {
+            "chat_id": chat_id,
+            "caller_key": caller_key,
+            "caller_id": caller_id,
+            "name": caller_name or "Unknown",
+            "updated_at": now,
+        },
+        "$setOnInsert": {
+            "calls": 0,
+            "wins": 0,
+            "profitables": 0,
+            "sum_x_peak": 0.0,
+            "best_x": 0.0,
+            "avg_x": 0.0,
+            "win_rate": 0.0,
+            "profitable_rate": 0.0,
+        },
+        "$max": {"best_x": float(best_x_candidate or 0.0)},
+    }
+    inc_doc = {}
+    if delta_calls:
+        inc_doc["calls"] = int(delta_calls)
+    if delta_wins:
+        inc_doc["wins"] = int(delta_wins)
+    if delta_profitables:
+        inc_doc["profitables"] = int(delta_profitables)
+    if abs(float(delta_sum_x_peak or 0.0)) > 1e-12:
+        inc_doc["sum_x_peak"] = float(delta_sum_x_peak)
+    if inc_doc:
+        update_doc["$inc"] = inc_doc
+    caller_rollups_collection.update_one(
+        {"chat_id": chat_id, "caller_key": caller_key},
+        update_doc,
+        upsert=True,
+    )
+    _refresh_rollup_rates(chat_id, caller_key)
+
+
+def upsert_rollup_for_call_insert(call_doc):
+    chat_id = int(call_doc.get("chat_id"))
+    caller_key = get_caller_key(call_doc)
+    x_peak = call_peak_x(call_doc)
+    if x_peak <= 0:
+        return
+    apply_rollup_delta(
+        chat_id=chat_id,
+        caller_id=call_doc.get("caller_id"),
+        caller_name=call_doc.get("caller_name", "Unknown"),
+        caller_key=caller_key,
+        delta_calls=1,
+        delta_wins=1 if x_peak >= WIN_MULTIPLIER else 0,
+        delta_profitables=1 if x_peak > 1.0 else 0,
+        delta_sum_x_peak=x_peak,
+        best_x_candidate=x_peak,
+    )
+
+
+def upsert_rollup_for_call_peak_delta(call_doc, old_x_peak, new_x_peak):
+    delta = float(new_x_peak or 0.0) - float(old_x_peak or 0.0)
+    if delta <= 1e-12:
+        return
+    caller_key = get_caller_key(call_doc)
+    delta_wins = 1 if (old_x_peak < WIN_MULTIPLIER <= new_x_peak) else 0
+    delta_profitables = 1 if (old_x_peak <= 1.0 < new_x_peak) else 0
+    apply_rollup_delta(
+        chat_id=int(call_doc.get("chat_id")),
+        caller_id=call_doc.get("caller_id"),
+        caller_name=call_doc.get("caller_name", "Unknown"),
+        caller_key=caller_key,
+        delta_calls=0,
+        delta_wins=delta_wins,
+        delta_profitables=delta_profitables,
+        delta_sum_x_peak=delta,
+        best_x_candidate=new_x_peak,
+    )
+
+
+def recompute_rollups_for_chat(chat_id):
+    match_query = accepted_call_filter(chat_id)
+    pipeline = [
+        {"$match": match_query},
+        {
+            "$project": {
+                "caller_id": 1,
+                "caller_name": 1,
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "token_calls_archive",
+                "pipeline": [
+                    {"$match": match_query},
+                    {
+                        "$project": {
+                            "caller_id": 1,
+                            "caller_name": 1,
+                            "initial_mcap": 1,
+                            "ath_mcap": 1,
+                            "current_mcap": 1,
+                        }
+                    },
+                ],
+            }
+        },
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+                "_name": {"$ifNull": ["$caller_name", "Unknown"]},
+            }
+        },
+        {"$match": {"_initial": {"$gt": 0}}},
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {
+            "$addFields": {
+                "_x_peak": {"$divide": ["$_peak", "$_initial"]},
+                "_caller_key": _mongo_caller_key_expr(),
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_caller_key",
+                "caller_id": {"$first": "$caller_id"},
+                "name": {"$first": "$_name"},
+                "calls": {"$sum": 1},
+                "wins": {"$sum": {"$cond": [{"$gte": ["$_x_peak", WIN_MULTIPLIER]}, 1, 0]}},
+                "profitables": {"$sum": {"$cond": [{"$gt": ["$_x_peak", 1]}, 1, 0]}},
+                "sum_x_peak": {"$sum": "$_x_peak"},
+                "best_x": {"$max": "$_x_peak"},
+            }
+        },
+    ]
+    rows = list(calls_collection.aggregate(pipeline, allowDiskUse=True))
+    caller_rollups_collection.delete_many({"chat_id": chat_id})
+    if not rows:
+        return 0
+
+    docs = []
+    now = utc_now()
+    for row in rows:
+        calls = int(row.get("calls", 0) or 0)
+        wins = int(row.get("wins", 0) or 0)
+        profitables = int(row.get("profitables", 0) or 0)
+        sum_x_peak = float(row.get("sum_x_peak", 0) or 0.0)
+        avg_x = (sum_x_peak / calls) if calls > 0 else 0.0
+        win_rate = (wins / calls * 100.0) if calls > 0 else 0.0
+        profitable_rate = (profitables / calls * 100.0) if calls > 0 else 0.0
+        docs.append(
+            {
+                "chat_id": chat_id,
+                "caller_key": row.get("_id"),
+                "caller_id": row.get("caller_id"),
+                "name": row.get("name", "Unknown"),
+                "calls": calls,
+                "wins": wins,
+                "profitables": profitables,
+                "sum_x_peak": sum_x_peak,
+                "best_x": float(row.get("best_x", 0) or 0.0),
+                "avg_x": float(avg_x),
+                "win_rate": float(win_rate),
+                "profitable_rate": float(profitable_rate),
+                "updated_at": now,
+            }
+        )
+    if docs:
+        caller_rollups_collection.insert_many(docs, ordered=False)
+    return len(docs)
+
+
+def ensure_rollups_ready(chat_id):
+    setting = settings_collection.find_one({"chat_id": chat_id}, {"rollup_version": 1}) or {}
+    if int(setting.get("rollup_version", 0) or 0) >= ROLLUP_SCHEMA_VERSION:
+        return
+    recompute_rollups_for_chat(chat_id)
+    settings_collection.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"rollup_version": ROLLUP_SCHEMA_VERSION}},
+        upsert=True,
+    )
+
+
 def get_reputation_penalty(chat_id, caller_id):
     if caller_id is None:
         return 0.0
@@ -1486,6 +1742,20 @@ def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
         mcap = float(token_meta.get("fdv", 0) or 0)
         if mcap <= 0:
             continue
+        candidates = list(
+            calls_collection.find(
+                _accepted_query(chat_id, {"ca_norm": ca_norm}),
+                {
+                    "_id": 1,
+                    "chat_id": 1,
+                    "caller_id": 1,
+                    "caller_name": 1,
+                    "initial_mcap": 1,
+                    "ath_mcap": 1,
+                    "current_mcap": 1,
+                },
+            )
+        )
         volume_h1 = float(token_meta.get("volume_h1", token_meta.get("volume_h24", 0)) or 0)
         volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
 
@@ -1512,6 +1782,15 @@ def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
         )
         total_matched += int(result.matched_count or 0)
         total_modified += int(result.modified_count or 0)
+        for doc in candidates:
+            initial = float(doc.get("initial_mcap", 0) or 0)
+            if initial <= 0:
+                continue
+            old_ath = float(doc.get("ath_mcap", initial) or initial)
+            old_current = float(doc.get("current_mcap", initial) or initial)
+            old_x = max(old_ath, old_current) / initial
+            new_x = max(old_ath, float(mcap)) / initial
+            upsert_rollup_for_call_peak_delta(doc, old_x, new_x)
 
     return {"matched": total_matched, "modified": total_modified}
 
@@ -2060,6 +2339,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 call_data["stashed_at"] = now
             calls_collection.insert_one(call_data)
             update_user_profile(chat_id, user, "accepted")
+            upsert_rollup_for_call_insert(call_data)
 
     invalidate_groupstats_cache(chat_id)
 
@@ -2110,7 +2390,12 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
         current_mcap = meta.get("fdv", call.get("current_mcap", call.get("initial_mcap", 0)))
         if not current_mcap:
             continue
+        initial_val = float(call.get("initial_mcap", 0) or 0)
+        old_ath_val = float(call.get("ath_mcap", current_mcap) or current_mcap)
+        old_current_val = float(call.get("current_mcap", current_mcap) or current_mcap)
+        old_x_peak = (max(old_ath_val, old_current_val) / initial_val) if initial_val > 0 else 0.0
         ath = max(float(call.get("ath_mcap", current_mcap)), float(current_mcap))
+        new_x_peak = (float(ath) / initial_val) if initial_val > 0 else 0.0
         volume_h1 = float(
             meta.get(
                 "volume_h1",
@@ -2143,6 +2428,7 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
             update_doc["$unset"] = unset_fields
         result = calls_collection.update_one({"_id": call["_id"]}, update_doc)
         updated += int(result.modified_count or 0)
+        upsert_rollup_for_call_peak_delta(call, old_x_peak, new_x_peak)
         call["current_mcap"] = current_mcap
         call["ath_mcap"] = ath
         call["volume_h1"] = volume_h1
@@ -2223,8 +2509,51 @@ def fetch_best_win_text(chat_id, time_filter):
 
 
 def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_per_page):
+    time_filter = time_filter or {}
     match_query = {**accepted_call_filter(chat_id), **(time_filter or {})}
     skip_rows = max(0, int(page)) * max(1, int(items_per_page))
+    if not time_filter:
+        ensure_rollups_ready(chat_id)
+        query = {"chat_id": chat_id, "calls": {"$gte": MIN_CALLS_REQUIRED}}
+        total = caller_rollups_collection.count_documents(query)
+        if total > 0:
+            sort_order = [
+                ("avg_x", ASCENDING if is_bottom else DESCENDING),
+                ("best_x", ASCENDING if is_bottom else DESCENDING),
+                ("win_rate", ASCENDING if is_bottom else DESCENDING),
+                ("calls", DESCENDING),
+            ]
+            rows = list(
+                caller_rollups_collection.find(
+                    query,
+                    {
+                        "_id": 0,
+                        "caller_id": 1,
+                        "name": 1,
+                        "calls": 1,
+                        "avg_x": 1,
+                        "best_x": 1,
+                        "win_rate": 1,
+                        "profitable_rate": 1,
+                    },
+                )
+                .sort(sort_order)
+                .skip(skip_rows)
+                .limit(max(1, int(items_per_page)))
+            )
+            mapped = [
+                {
+                    "caller_id": row.get("caller_id"),
+                    "name": row.get("name", "Unknown"),
+                    "calls": int(row.get("calls", 0) or 0),
+                    "avg_now_x": float(row.get("avg_x", 0.0) or 0.0),
+                    "best_x": float(row.get("best_x", 0.0) or 0.0),
+                    "win_rate": float(row.get("win_rate", 0.0) or 0.0),
+                    "profitable_rate": float(row.get("profitable_rate", 0.0) or 0.0),
+                }
+                for row in rows
+            ]
+            return mapped, int(total)
 
     group_pipeline = [
         {"$match": match_query},
@@ -2605,7 +2934,11 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     win_pct = metrics["win_rate"] * 100
     caller_penalty = get_reputation_penalty(chat_id, caller_id) if caller_id is not None else 0.0
     caller_score = max(0.0, metrics["reputation"] - caller_penalty)
-    recent_cas_norm = [c.get("ca_norm", normalize_ca(c.get("ca", ""))) for c in recent_calls if c.get("ca")]
+    recent_cas_norm = []
+    for c in recent_calls:
+        ca_norm = c.get("ca_norm", normalize_ca(c.get("ca", "")))
+        if ca_norm:
+            recent_cas_norm.append(ca_norm)
     recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
     avg_text = format_return(1 + metrics["avg_ath"])
     best_text = format_return(metrics["best_x"])
@@ -2634,7 +2967,12 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
         ca_norm = call.get("ca_norm", normalize_ca(ca))
-        symbol = recent_meta.get(ca_norm, {}).get("symbol") or call.get("token_symbol", "")
+        meta = recent_meta.get(ca_norm, {})
+        live_fdv = float(meta.get("fdv", 0) or 0)
+        if live_fdv > 0:
+            current = live_fdv
+            ath = max(ath, live_fdv)
+        symbol = meta.get("symbol") or call.get("token_symbol", "")
         token = token_label(symbol, ca)
         lines.append(
             f"• {html.escape(token)} ({call_date})\n"
@@ -3103,6 +3441,13 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     live_deleted = calls_collection.delete_many(query).deleted_count
     archive_deleted = calls_archive_collection.delete_many(query).deleted_count
     total_deleted = int(live_deleted or 0) + int(archive_deleted or 0)
+    if total_deleted > 0:
+        recompute_rollups_for_chat(chat_id)
+        settings_collection.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"rollup_version": ROLLUP_SCHEMA_VERSION}},
+            upsert=True,
+        )
     invalidate_groupstats_cache(chat_id)
 
     await msg.reply_text(
