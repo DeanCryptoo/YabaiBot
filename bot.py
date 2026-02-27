@@ -4,8 +4,6 @@ import math
 import html
 import json
 import time
-import secrets
-import string
 import asyncio
 import requests
 import certifi
@@ -879,29 +877,14 @@ async def user_is_admin(bot, chat_id, user_id):
     return member.status in {"administrator", "creator"}
 
 
-def _generate_group_key(length=8):
-    alphabet = string.ascii_uppercase + string.digits
-    return "YB-" + "".join(secrets.choice(alphabet) for _ in range(length))
-
-
 def ensure_group_key(chat_id):
-    existing = settings_collection.find_one({"chat_id": chat_id}, {"group_key": 1}) or {}
-    group_key = existing.get("group_key")
-    if group_key:
-        return group_key
-
-    for _ in range(20):
-        candidate = _generate_group_key()
-        conflict = settings_collection.find_one({"group_key": candidate}, {"_id": 1})
-        if conflict:
-            continue
-        settings_collection.update_one(
-            {"chat_id": chat_id},
-            {"$setOnInsert": {"chat_id": chat_id}, "$set": {"group_key": candidate}},
-            upsert=True,
-        )
-        return candidate
-    return None
+    canonical_key = str(int(chat_id))
+    settings_collection.update_one(
+        {"chat_id": chat_id},
+        {"$setOnInsert": {"chat_id": chat_id}, "$set": {"group_key": canonical_key}},
+        upsert=True,
+    )
+    return canonical_key
 
 
 async def resolve_target_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE, admin_required=False):
@@ -1368,6 +1351,7 @@ async def heartbeat_loop(application: Application):
             chat_ids = get_tracked_chat_ids()
             for chat_id in chat_ids:
                 try:
+                    ensure_group_key(chat_id)
                     refresh_started = time.perf_counter()
                     refreshed_calls = refresh_recent_call_peaks(chat_id)
                     refresh_elapsed_ms = (time.perf_counter() - refresh_started) * 1000.0
@@ -1410,15 +1394,30 @@ async def link_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Usage: /linkgroup <group_key>")
         return
 
-    group_key = context.args[0].strip().upper()
-    setting = settings_collection.find_one({"group_key": group_key}) or {}
-    target_chat_id = setting.get("chat_id")
+    raw_key = context.args[0].strip()
+    target_chat_id = None
+    group_key = None
+
+    # Primary path: group key is the literal Telegram group chat id.
+    try:
+        target_chat_id = int(raw_key)
+        group_key = str(target_chat_id)
+    except ValueError:
+        # Backward compatibility: allow legacy/random keys that may still exist in settings.
+        legacy = settings_collection.find_one({"group_key": raw_key}) or {}
+        target_chat_id = legacy.get("chat_id")
+        if target_chat_id is not None:
+            group_key = str(int(target_chat_id))
+
     if target_chat_id is None:
-        await msg.reply_text("Invalid group key.")
+        await msg.reply_text("Invalid group key. Use the group chat id from /adminstats.")
         return
     if not await user_is_admin(context.bot, target_chat_id, user.id):
         await msg.reply_text("You must be an admin of that group to link it.")
         return
+
+    # Normalize/migrate settings to canonical key.
+    group_key = ensure_group_key(target_chat_id)
 
     private_links_collection.update_one(
         {"user_id": user.id},
