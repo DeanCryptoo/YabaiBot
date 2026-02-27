@@ -44,6 +44,7 @@ ATH_TRACK_MAX_CALLS_PER_CHAT = 800
 HEARTBEAT_CALLS_PER_CALLER = 2
 INACTIVE_CALLER_ARCHIVE_HOURS = 24
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
+LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS = max(1, int(os.getenv("LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS", "3")))
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
 GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
@@ -1342,10 +1343,13 @@ def _to_archive_doc(call_doc):
     }
 
 
-def archive_stashed_calls(chat_id, reason="older_call", limit=1000):
+def archive_stashed_calls(chat_id, reason="older_call", limit=1000, older_than=None):
+    query = _accepted_query(chat_id, {"is_stashed": True, "stashed_reason": reason})
+    if older_than is not None:
+        query = {**query, "timestamp": {"$lt": older_than}}
     candidates = list(
         calls_collection.find(
-            _accepted_query(chat_id, {"is_stashed": True, "stashed_reason": reason}),
+            query,
             {"message_id": 0, "message_date": 0, "caller_username": 0, "ca": 0},
         )
         .sort("timestamp", 1)
@@ -1426,6 +1430,13 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
     archived_inactive = archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000)
     stashed_count = stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
     archived_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000)
+    low_volume_cutoff = utc_now() - timedelta(hours=LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS)
+    archived_low_pre = archive_stashed_calls(
+        chat_id,
+        reason="low_volume",
+        limit=1000,
+        older_than=low_volume_cutoff,
+    )
     cutoff = utc_now() - timedelta(days=lookback_days)
     calls = list(
         calls_collection.find(
@@ -1435,10 +1446,18 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
         .limit(limit)
     )
     if not calls:
-        if archived_inactive > 0 or stashed_count > 0 or archived_old > 0:
+        if archived_inactive > 0 or stashed_count > 0 or archived_old > 0 or archived_low_pre > 0:
             invalidate_groupstats_cache(chat_id)
         return 0
     refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=True)
+    archived_low_post = archive_stashed_calls(
+        chat_id,
+        reason="low_volume",
+        limit=1000,
+        older_than=low_volume_cutoff,
+    )
+    if archived_low_post > 0:
+        invalidate_groupstats_cache(chat_id)
     invalidate_groupstats_cache(chat_id)
     return len(calls)
 
