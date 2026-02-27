@@ -1081,7 +1081,7 @@ def compute_daily_digest_data(chat_id, since_ts):
             {
                 "name": call_set[0].get("caller_name", "Unknown"),
                 "calls": metrics["calls"],
-                "avg_now_x": 1.0 + metrics["avg_now"],
+                "avg_now_x": 1.0 + metrics["avg_ath"],
                 "best_x": metrics["best_x"],
                 "win_rate": metrics["win_rate"] * 100,
             }
@@ -1552,7 +1552,7 @@ async def _fetch_and_calculate_rankings(update: Update, context: ContextTypes.DE
                 "name": caller_name,
                 "calls": metrics["calls"],
                 "avg_ath_x": 1.0 + metrics["avg_ath"],
-                "avg_now_x": 1.0 + metrics["avg_now"],
+                "avg_now_x": 1.0 + metrics["avg_ath"],
                 "best_x": metrics["best_x"],
                 "win_rate": metrics["win_rate"] * 100,
                 "profitable_rate": metrics["profitable_rate"] * 100,
@@ -1728,7 +1728,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     caller_score = max(0.0, metrics["reputation"] - caller_penalty)
     recent_cas_norm = [c.get("ca_norm", normalize_ca(c.get("ca", ""))) for c in recent_calls if c.get("ca")]
     recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
-    avg_text = format_return(1 + metrics["avg_now"])
+    avg_text = format_return(1 + metrics["avg_ath"])
     best_text = format_return(metrics["best_x"])
     stars = stars_from_score(caller_score)
 
@@ -1840,7 +1840,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Your Performance  {stars}\n"
         f"────────────────\n"
         f"📞 Calls: {metrics['calls']}\n"
-        f"📈 Avg: {format_return(1 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
+        f"📈 Avg: {format_return(1 + metrics['avg_ath'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
         f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%\n"
         f"⭐ Score: {score:.1f}/100\n"
         f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})\n"
@@ -1851,7 +1851,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📈 Your Performance  {stars}\n"
         f"────────────────\n"
         f"📞 Calls: {metrics['calls']}\n"
-        f"📈 Avg: {format_return(1 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
+        f"📈 Avg: {format_return(1 + metrics['avg_ath'])} | 🔥 Best: {format_return(metrics['best_x'])}\n"
         f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%\n"
         f"⭐ Score: {score:.1f}/100\n"
         f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})\n"
@@ -1863,7 +1863,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
             display_name=update.effective_user.full_name or update.effective_user.first_name or "Caller",
             stars=stars,
             calls=metrics["calls"],
-            avg_text=format_return(1 + metrics["avg_now"]),
+            avg_text=format_return(1 + metrics["avg_ath"]),
             best_text=format_return(metrics["best_x"]),
             hit_rate_pct=win_pct,
             score_value=score,
@@ -1922,7 +1922,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"────────────────\n"
         f"👥 Callers: {len(unique_callers)} | 📞 Calls: {total_calls}\n"
         f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {group_metrics['win_rate'] * 100:.1f}%\n"
-        f"📈 Group Avg: {format_return(1 + group_metrics['avg_now'])}\n"
+        f"📈 Group Avg: {format_return(1 + group_metrics['avg_ath'])}\n"
         f"🔥 Best Call: {best_text}\n"
         f"{best_by_text}"
     )
@@ -1937,7 +1937,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         callers_count=len(unique_callers),
         total_calls=total_calls,
         win_rate_pct=group_metrics["win_rate"] * 100,
-        avg_text=format_return(1 + group_metrics["avg_now"]),
+        avg_text=format_return(1 + group_metrics["avg_ath"]),
         best_text=best_text,
         best_caller=best_caller,
         group_avatar_image=group_avatar_image,
@@ -2022,7 +2022,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "name": user_call_set[0].get("caller_name", "Unknown"),
                 "calls": m["calls"],
                 "win_rate": m["win_rate"] * 100,
-                "avg_now_x": 1 + m["avg_now"],
+                "avg_now_x": 1 + m["avg_ath"],
             }
         )
     low_performers.sort(key=lambda x: (x["win_rate"], x["avg_now_x"]))
@@ -2085,14 +2085,14 @@ async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         f"Group Mini Chart ({time_text})",
         metrics["win_rate"] * 100.0,
         metrics["profitable_rate"] * 100.0,
-        1.0 + metrics["avg_now"],
+        1.0 + metrics["avg_ath"],
     )
     caption = (
         f"📊 GROUP MINI CHART ({time_text.upper()})\n"
         f"────────────────\n"
         f"🎯 Win Rate: {metrics['win_rate'] * 100:.1f}%\n"
         f"💹 Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
-        f"📈 Avg: {format_return(1.0 + metrics['avg_now'])}"
+        f"📈 Avg: {format_return(1.0 + metrics['avg_ath'])}"
     )
     await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
 
@@ -2114,7 +2114,7 @@ async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"{caller_name} Mini Chart",
         metrics["win_rate"] * 100.0,
         metrics["profitable_rate"] * 100.0,
-        1.0 + metrics["avg_now"],
+        1.0 + metrics["avg_ath"],
     )
     caption = (
         f"📊 CALLER MINI CHART\n"
@@ -2122,7 +2122,7 @@ async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"👤 {caller_name}\n"
         f"🎯 Win Rate: {metrics['win_rate'] * 100:.1f}%\n"
         f"💹 Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
-        f"📈 Avg: {format_return(1.0 + metrics['avg_now'])} | 🔥 Best: {format_return(metrics['best_x'])}"
+        f"📈 Avg: {format_return(1.0 + metrics['avg_ath'])} | 🔥 Best: {format_return(metrics['best_x'])}"
     )
     await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
 
@@ -2144,7 +2144,7 @@ def top_caller_id(chat_id: int, lookback_days: int = 7):
     best_score = -10**9
     for caller_id, call_set in user_calls.items():
         metrics = derive_user_metrics(call_set)
-        score = (1.0 + metrics["avg_now"]) + (metrics["win_rate"] * 0.5)
+        score = (1.0 + metrics["avg_ath"]) + (metrics["win_rate"] * 0.5)
         if metrics["calls"] >= 2 and score > best_score:
             best = caller_id
             best_score = score
