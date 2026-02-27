@@ -2069,13 +2069,39 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     last_heartbeat_at = runtime.get("last_heartbeat_at")
     if isinstance(last_heartbeat_at, datetime):
         last_heartbeat_text = last_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        next_heartbeat_at = last_heartbeat_at + timedelta(seconds=HEARTBEAT_INTERVAL_SECONDS)
+        next_heartbeat_text = next_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     else:
         last_heartbeat_text = "N/A"
+        next_heartbeat_at = None
+        next_heartbeat_text = "N/A (waiting first heartbeat)"
 
     avg_refresh_ms = float(runtime.get("avg_refresh_duration_ms", 0.0) or 0.0)
     last_refresh_ms = float(runtime.get("last_refresh_duration_ms", 0.0) or 0.0)
     refresh_runs = int(runtime.get("refresh_runs", 0) or 0)
     last_refreshed_calls = int(runtime.get("last_refreshed_calls", 0) or 0)
+
+    setting = settings_collection.find_one({"chat_id": chat.id}) or {}
+    alerts_enabled = bool(setting.get("alerts", False))
+    now_utc = utc_now()
+    today = now_utc.strftime("%Y-%m-%d")
+    last_digest_date = setting.get("last_digest_date")
+    digest_hour_today = now_utc.replace(hour=DIGEST_HOUR_UTC, minute=0, second=0, microsecond=0)
+
+    if not alerts_enabled:
+        next_digest_text = "Disabled (alerts off)"
+    else:
+        if last_digest_date == today:
+            next_digest_at = digest_hour_today + timedelta(days=1)
+        elif now_utc < digest_hour_today:
+            next_digest_at = digest_hour_today
+        else:
+            next_digest_at = next_heartbeat_at
+
+        if isinstance(next_digest_at, datetime):
+            next_digest_text = next_digest_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        else:
+            next_digest_text = "Pending (next heartbeat)"
 
     lines = [
         "🛡️ Admin Panel",
@@ -2125,6 +2151,8 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"🧊 Stashed/Active: {stashed_calls}/{active_calls} ({stashed_pct:.1f}% stashed)")
     lines.append(f"🧠 Dex Cache: {cache_live}/{cache_total} live entries")
     lines.append(f"💓 Last Heartbeat: {last_heartbeat_text}")
+    lines.append(f"⏭ Next Heartbeat: {next_heartbeat_text}")
+    lines.append(f"📰 Next Digest: {next_digest_text}")
     lines.append(f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)")
     lines.append(f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}")
 
