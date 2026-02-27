@@ -61,6 +61,7 @@ private_links_collection = db["private_links"]
 CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
 _dex_meta_cache = {}
 _ops_runtime = {"by_chat": {}}
+_leaderboard_sessions = {}
 
 
 def ensure_indexes():
@@ -984,6 +985,68 @@ def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
     row["avg_refresh_duration_ms"] = float(new_avg)
     row["refresh_runs"] = new_runs
     row["last_refreshed_calls"] = int(refreshed_calls or 0)
+
+
+def save_leaderboard_session(message_obj, state):
+    if not message_obj:
+        return
+    key = (int(message_obj.chat_id), int(message_obj.message_id))
+    _leaderboard_sessions[key] = {**(state or {}), "saved_at": utc_now()}
+    if len(_leaderboard_sessions) > 600:
+        oldest = sorted(
+            _leaderboard_sessions.items(),
+            key=lambda kv: kv[1].get("saved_at", utc_now()),
+        )[:100]
+        for old_key, _ in oldest:
+            _leaderboard_sessions.pop(old_key, None)
+
+
+def load_leaderboard_session(message_obj):
+    if not message_obj:
+        return None
+    key = (int(message_obj.chat_id), int(message_obj.message_id))
+    row = _leaderboard_sessions.get(key)
+    if not row:
+        return None
+    saved_at = row.get("saved_at")
+    if isinstance(saved_at, datetime) and (utc_now() - saved_at).total_seconds() > 6 * 3600:
+        _leaderboard_sessions.pop(key, None)
+        return None
+    return dict(row)
+
+
+def apply_leaderboard_state(context, state):
+    if not state:
+        return
+    keys = [
+        "leaderboard_chat_id",
+        "leaderboard_time_filter",
+        "leaderboard_is_bottom",
+        "leaderboard_title",
+        "leaderboard_total",
+        "leaderboard_highlight_label",
+        "leaderboard_highlight_text",
+        "leaderboard_owner_id",
+        "leaderboard_image_mode",
+    ]
+    for key in keys:
+        if key in state:
+            context.chat_data[key] = state[key]
+
+
+def snapshot_leaderboard_state(context):
+    keys = [
+        "leaderboard_chat_id",
+        "leaderboard_time_filter",
+        "leaderboard_is_bottom",
+        "leaderboard_title",
+        "leaderboard_total",
+        "leaderboard_highlight_label",
+        "leaderboard_highlight_text",
+        "leaderboard_owner_id",
+        "leaderboard_image_mode",
+    ]
+    return {key: context.chat_data.get(key) for key in keys}
 
 
 def _accepted_query(chat_id, extra=None):
@@ -2006,17 +2069,19 @@ async def _fetch_and_calculate_rankings(
         )
         context.chat_data["leaderboard_image_mode"] = True
         caption_text, reply_markup = build_leaderboard_page(context, page=0)
-        await update.effective_message.reply_photo(
+        sent = await update.effective_message.reply_photo(
             photo=spotlight,
             caption=caption_text,
             reply_markup=reply_markup,
         )
+        save_leaderboard_session(sent, snapshot_leaderboard_state(context))
         return
     except Exception:
         context.chat_data["leaderboard_image_mode"] = False
 
     text, reply_markup = build_leaderboard_page(context, page=0)
-    await update.effective_message.reply_text(text, reply_markup=reply_markup)
+    sent = await update.effective_message.reply_text(text, reply_markup=reply_markup)
+    save_leaderboard_session(sent, snapshot_leaderboard_state(context))
 
 
 async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2110,8 +2175,14 @@ async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     page = int(query.data.split("_")[1])
+
+    session_state = load_leaderboard_session(query.message)
+    if session_state:
+        apply_leaderboard_state(context, session_state)
+
     if "leaderboard_chat_id" in context.chat_data:
         await render_leaderboard_page(query.message, context, page)
+        save_leaderboard_session(query.message, snapshot_leaderboard_state(context))
     else:
         try:
             if getattr(query.message, "photo", None):
