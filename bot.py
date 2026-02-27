@@ -57,6 +57,7 @@ user_profiles_collection = db["user_profiles"]
 
 CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
 _dex_meta_cache = {}
+_ops_runtime = {"by_chat": {}}
 
 
 def ensure_indexes():
@@ -889,6 +890,30 @@ async def fetch_chat_avatar_image(bot, chat_id):
         return None
 
 
+def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
+    now = utc_now()
+    by_chat = _ops_runtime.setdefault("by_chat", {})
+    row = by_chat.setdefault(
+        chat_id,
+        {
+            "last_heartbeat_at": None,
+            "last_refresh_duration_ms": 0.0,
+            "avg_refresh_duration_ms": 0.0,
+            "refresh_runs": 0,
+            "last_refreshed_calls": 0,
+        },
+    )
+    prev_runs = int(row.get("refresh_runs", 0) or 0)
+    prev_avg = float(row.get("avg_refresh_duration_ms", 0.0) or 0.0)
+    new_runs = prev_runs + 1
+    new_avg = ((prev_avg * prev_runs) + float(refresh_duration_ms)) / max(1, new_runs)
+    row["last_heartbeat_at"] = now
+    row["last_refresh_duration_ms"] = float(refresh_duration_ms)
+    row["avg_refresh_duration_ms"] = float(new_avg)
+    row["refresh_runs"] = new_runs
+    row["last_refreshed_calls"] = int(refreshed_calls or 0)
+
+
 def _accepted_query(chat_id, extra=None):
     query = accepted_call_filter(chat_id)
     if extra:
@@ -1292,7 +1317,10 @@ async def heartbeat_loop(application: Application):
             chat_ids = get_tracked_chat_ids()
             for chat_id in chat_ids:
                 try:
-                    refresh_recent_call_peaks(chat_id)
+                    refresh_started = time.perf_counter()
+                    refreshed_calls = refresh_recent_call_peaks(chat_id)
+                    refresh_elapsed_ms = (time.perf_counter() - refresh_started) * 1000.0
+                    record_refresh_runtime(chat_id, refresh_elapsed_ms, refreshed_calls)
                     await run_streak_scan_for_chat(application.bot, chat_id, manual=False)
                     await send_daily_digest(application.bot, chat_id, manual=False)
                 except Exception as exc:
@@ -2071,6 +2099,50 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(lines))
 
 
+async def ops_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not await user_is_admin(context.bot, chat.id, user.id):
+        await msg.reply_text("Admin only command")
+        return
+
+    accepted_query = accepted_call_filter(chat.id)
+    tracked_calls = calls_collection.count_documents(accepted_query)
+    stashed_calls = calls_collection.count_documents({**accepted_query, "is_stashed": True})
+    active_calls = max(0, tracked_calls - stashed_calls)
+    stashed_pct = (stashed_calls / tracked_calls * 100.0) if tracked_calls > 0 else 0.0
+
+    now_ts = time.time()
+    cache_total = len(_dex_meta_cache)
+    cache_live = sum(1 for entry in _dex_meta_cache.values() if entry.get("expires_at", 0) > now_ts)
+
+    runtime = _ops_runtime.get("by_chat", {}).get(chat.id, {})
+    last_heartbeat_at = runtime.get("last_heartbeat_at")
+    if isinstance(last_heartbeat_at, datetime):
+        last_heartbeat_text = last_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        last_heartbeat_text = "N/A"
+
+    avg_refresh_ms = float(runtime.get("avg_refresh_duration_ms", 0.0) or 0.0)
+    last_refresh_ms = float(runtime.get("last_refresh_duration_ms", 0.0) or 0.0)
+    refresh_runs = int(runtime.get("refresh_runs", 0) or 0)
+    last_refreshed_calls = int(runtime.get("last_refreshed_calls", 0) or 0)
+
+    lines = [
+        "📡 Ops Snapshot",
+        "────────────────",
+        f"🗂 Tracked Calls: {tracked_calls}",
+        f"🧊 Stashed/Active: {stashed_calls}/{active_calls} ({stashed_pct:.1f}% stashed)",
+        f"🧠 Dex Cache: {cache_live}/{cache_total} live entries",
+        f"💓 Last Heartbeat: {last_heartbeat_text}",
+        f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)",
+        f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}",
+    ]
+    await msg.reply_text("\n".join(lines))
+
+
 async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, time_arg: str = "7d"):
     fake_context = type("obj", (), {"args": [time_arg]})()
     time_filter, time_text = _resolve_time_filter(fake_context)
@@ -2259,6 +2331,7 @@ def main():
     app.add_handler(CommandHandler("groupstats", group_stats))
     app.add_handler(CommandHandler("myscore", my_score))
     app.add_handler(CommandHandler("adminstats", admin_stats))
+    app.add_handler(CommandHandler("ops", ops_stats))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
