@@ -2055,6 +2055,28 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     low_performers.sort(key=lambda x: (x["win_rate"], x["avg_now_x"]))
 
+    accepted_query = accepted_call_filter(chat.id)
+    tracked_calls = calls_collection.count_documents(accepted_query)
+    stashed_calls = calls_collection.count_documents({**accepted_query, "is_stashed": True})
+    active_calls = max(0, tracked_calls - stashed_calls)
+    stashed_pct = (stashed_calls / tracked_calls * 100.0) if tracked_calls > 0 else 0.0
+
+    now_ts = time.time()
+    cache_total = len(_dex_meta_cache)
+    cache_live = sum(1 for entry in _dex_meta_cache.values() if entry.get("expires_at", 0) > now_ts)
+
+    runtime = _ops_runtime.get("by_chat", {}).get(chat.id, {})
+    last_heartbeat_at = runtime.get("last_heartbeat_at")
+    if isinstance(last_heartbeat_at, datetime):
+        last_heartbeat_text = last_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    else:
+        last_heartbeat_text = "N/A"
+
+    avg_refresh_ms = float(runtime.get("avg_refresh_duration_ms", 0.0) or 0.0)
+    last_refresh_ms = float(runtime.get("last_refresh_duration_ms", 0.0) or 0.0)
+    refresh_runs = int(runtime.get("refresh_runs", 0) or 0)
+    last_refreshed_calls = int(runtime.get("last_refreshed_calls", 0) or 0)
+
     lines = [
         "🛡️ Admin Panel",
         "────────────────",
@@ -2096,50 +2118,16 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines.append("- None")
 
-    await msg.reply_text("\n".join(lines))
+    lines.append("")
+    lines.append("📡 Ops Snapshot")
+    lines.append("────────────────")
+    lines.append(f"🗂 Tracked Calls: {tracked_calls}")
+    lines.append(f"🧊 Stashed/Active: {stashed_calls}/{active_calls} ({stashed_pct:.1f}% stashed)")
+    lines.append(f"🧠 Dex Cache: {cache_live}/{cache_total} live entries")
+    lines.append(f"💓 Last Heartbeat: {last_heartbeat_text}")
+    lines.append(f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)")
+    lines.append(f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}")
 
-
-async def ops_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-
-    if not await user_is_admin(context.bot, chat.id, user.id):
-        await msg.reply_text("Admin only command")
-        return
-
-    accepted_query = accepted_call_filter(chat.id)
-    tracked_calls = calls_collection.count_documents(accepted_query)
-    stashed_calls = calls_collection.count_documents({**accepted_query, "is_stashed": True})
-    active_calls = max(0, tracked_calls - stashed_calls)
-    stashed_pct = (stashed_calls / tracked_calls * 100.0) if tracked_calls > 0 else 0.0
-
-    now_ts = time.time()
-    cache_total = len(_dex_meta_cache)
-    cache_live = sum(1 for entry in _dex_meta_cache.values() if entry.get("expires_at", 0) > now_ts)
-
-    runtime = _ops_runtime.get("by_chat", {}).get(chat.id, {})
-    last_heartbeat_at = runtime.get("last_heartbeat_at")
-    if isinstance(last_heartbeat_at, datetime):
-        last_heartbeat_text = last_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    else:
-        last_heartbeat_text = "N/A"
-
-    avg_refresh_ms = float(runtime.get("avg_refresh_duration_ms", 0.0) or 0.0)
-    last_refresh_ms = float(runtime.get("last_refresh_duration_ms", 0.0) or 0.0)
-    refresh_runs = int(runtime.get("refresh_runs", 0) or 0)
-    last_refreshed_calls = int(runtime.get("last_refreshed_calls", 0) or 0)
-
-    lines = [
-        "📡 Ops Snapshot",
-        "────────────────",
-        f"🗂 Tracked Calls: {tracked_calls}",
-        f"🧊 Stashed/Active: {stashed_calls}/{active_calls} ({stashed_pct:.1f}% stashed)",
-        f"🧠 Dex Cache: {cache_live}/{cache_total} live entries",
-        f"💓 Last Heartbeat: {last_heartbeat_text}",
-        f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)",
-        f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}",
-    ]
     await msg.reply_text("\n".join(lines))
 
 
@@ -2331,7 +2319,6 @@ def main():
     app.add_handler(CommandHandler("groupstats", group_stats))
     app.add_handler(CommandHandler("myscore", my_score))
     app.add_handler(CommandHandler("adminstats", admin_stats))
-    app.add_handler(CommandHandler("ops", ops_stats))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
