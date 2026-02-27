@@ -53,6 +53,7 @@ client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client["yabai_crypto_bot"]
 
 calls_collection = db["token_calls"]
+calls_archive_collection = db["token_calls_archive"]
 settings_collection = db["group_settings"]
 user_profiles_collection = db["user_profiles"]
 private_links_collection = db["private_links"]
@@ -72,6 +73,9 @@ def ensure_indexes():
     calls_collection.create_index([("chat_id", ASCENDING), ("is_stashed", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("message_id", ASCENDING), ("chat_id", ASCENDING)])
+    calls_archive_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_archive_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_archive_collection.create_index([("chat_id", ASCENDING), ("ca_norm", ASCENDING)])
 
     user_profiles_collection.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
     settings_collection.create_index([("chat_id", ASCENDING)], unique=True)
@@ -809,7 +813,17 @@ def call_is_duplicate(chat_id, ca_norm):
         },
         {"_id": 1},
     )
-    return existing is not None
+    if existing is not None:
+        return True
+    archived = calls_archive_collection.find_one(
+        {
+            "chat_id": chat_id,
+            "ca_norm": ca_norm,
+            "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+        },
+        {"_id": 1},
+    )
+    return archived is not None
 
 
 def get_caller_key(call_doc):
@@ -992,8 +1006,56 @@ def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER):
     return int(result.modified_count or 0)
 
 
+def _to_archive_doc(call_doc):
+    return {
+        "chat_id": call_doc.get("chat_id"),
+        "status": "accepted",
+        "ca_norm": call_doc.get("ca_norm", normalize_ca(call_doc.get("ca", ""))),
+        "token_symbol": call_doc.get("token_symbol", ""),
+        "caller_id": call_doc.get("caller_id"),
+        "caller_name": call_doc.get("caller_name", "Unknown"),
+        "timestamp": call_doc.get("timestamp", utc_now()),
+        "initial_mcap": float(call_doc.get("initial_mcap", 0) or 0),
+        "ath_mcap": float(call_doc.get("ath_mcap", 0) or 0),
+        "current_mcap": float(call_doc.get("current_mcap", 0) or 0),
+        "stashed_reason": call_doc.get("stashed_reason", "older_call"),
+        "archived_at": utc_now(),
+    }
+
+
+def archive_stashed_calls(chat_id, reason="older_call", limit=1000):
+    candidates = list(
+        calls_collection.find(
+            _accepted_query(chat_id, {"is_stashed": True, "stashed_reason": reason}),
+            {"message_id": 0, "message_date": 0, "caller_username": 0, "ca": 0},
+        )
+        .sort("timestamp", 1)
+        .limit(limit)
+    )
+    if not candidates:
+        return 0
+
+    archive_docs = [_to_archive_doc(doc) for doc in candidates]
+    if archive_docs:
+        calls_archive_collection.insert_many(archive_docs, ordered=False)
+
+    ids = [doc["_id"] for doc in candidates if doc.get("_id") is not None]
+    if not ids:
+        return 0
+    result = calls_collection.delete_many({"_id": {"$in": ids}})
+    return int(result.deleted_count or 0)
+
+
+def load_calls_for_stats(chat_id, extra=None, include_archive=True):
+    query = _accepted_query(chat_id, extra or {})
+    live_calls = list(calls_collection.find(query))
+    archived_calls = list(calls_archive_collection.find(query)) if include_archive else []
+    return live_calls, archived_calls, (live_calls + archived_calls)
+
+
 def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
     stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
+    archive_stashed_calls(chat_id, reason="older_call", limit=1000)
     cutoff = utc_now() - timedelta(days=lookback_days)
     calls = list(
         calls_collection.find(
@@ -1148,8 +1210,7 @@ async def run_streak_scan_for_chat(bot, chat_id, manual=False):
 
 
 def compute_daily_digest_data(chat_id, since_ts):
-    query = _accepted_query(chat_id, {"timestamp": {"$gte": since_ts}})
-    calls = list(calls_collection.find(query))
+    live_calls, archived_calls, calls = load_calls_for_stats(chat_id, {"timestamp": {"$gte": since_ts}}, include_archive=True)
     if not calls:
         return {
             "has_calls": False,
@@ -1164,7 +1225,7 @@ def compute_daily_digest_data(chat_id, since_ts):
             "total_callers": 0,
         }
 
-    refresh_calls_market_data(calls)
+    refresh_calls_market_data(live_calls)
     user_calls = {}
     for call in calls:
         user_calls.setdefault(get_caller_key(call), []).append(call)
@@ -1685,6 +1746,36 @@ def fetch_best_win_text(chat_id, time_filter):
     pipeline = [
         {"$match": match_query},
         {
+            "$project": {
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+                "token_symbol": 1,
+                "ca": 1,
+                "ca_norm": 1,
+                "caller_name": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "token_calls_archive",
+                "pipeline": [
+                    {"$match": match_query},
+                    {
+                        "$project": {
+                            "initial_mcap": 1,
+                            "ath_mcap": 1,
+                            "current_mcap": 1,
+                            "token_symbol": 1,
+                            "ca": "$ca_norm",
+                            "ca_norm": 1,
+                            "caller_name": 1,
+                        }
+                    },
+                ],
+            }
+        },
+        {
             "$addFields": {
                 "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
                 "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
@@ -1724,6 +1815,32 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
 
     group_pipeline = [
         {"$match": match_query},
+        {
+            "$project": {
+                "caller_id": 1,
+                "caller_name": 1,
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "token_calls_archive",
+                "pipeline": [
+                    {"$match": match_query},
+                    {
+                        "$project": {
+                            "caller_id": 1,
+                            "caller_name": 1,
+                            "initial_mcap": 1,
+                            "ath_mcap": 1,
+                            "current_mcap": 1,
+                        }
+                    },
+                ],
+            }
+        },
         {
             "$addFields": {
                 "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
@@ -1963,10 +2080,16 @@ async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYP
     query = update.callback_query
     await query.answer()
     page = int(query.data.split("_")[1])
-    if "leaderboard_data" in context.chat_data:
+    if "leaderboard_chat_id" in context.chat_data:
         await render_leaderboard_page(query.message, context, page)
     else:
-        await query.message.edit_text("Data expired. Run the command again.")
+        try:
+            if getattr(query.message, "photo", None):
+                await query.message.edit_caption(caption="Data expired. Run the command again.")
+            else:
+                await query.message.edit_text("Data expired. Run the command again.")
+        except Exception:
+            await query.message.reply_text("Data expired. Run the command again.")
 
 
 async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1992,12 +2115,14 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
     }
 
-    all_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
+    live_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
+    archived_user_calls = list(calls_archive_collection.find(query).sort("timestamp", -1))
+    all_user_calls = sorted(live_user_calls + archived_user_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)
     if not all_user_calls:
         await update.effective_message.reply_text(f"No calls found for '{target}' in this group")
         return
 
-    refresh_calls_market_data(all_user_calls)
+    refresh_calls_market_data(live_user_calls)
     metrics = derive_user_metrics(all_user_calls)
     rug = derive_rug_stats(all_user_calls)
 
@@ -2028,7 +2153,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     for call in recent_calls:
-        ca = call.get("ca", "")
+        ca = call.get("ca", "") or call.get("ca_norm", "")
         initial = float(call.get("initial_mcap", 0) or 0)
         current = float(call.get("current_mcap", initial) or initial)
         ath = float(call.get("ath_mcap", current) or current)
@@ -2096,7 +2221,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
 
-    user_calls = list(
+    live_calls = list(
         calls_collection.find(
             {
                 "chat_id": chat_id,
@@ -2105,12 +2230,22 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
         )
     )
+    archived_calls = list(
+        calls_archive_collection.find(
+            {
+                "chat_id": chat_id,
+                "caller_id": user.id,
+                "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
+            }
+        )
+    )
+    user_calls = live_calls + archived_calls
 
     if not user_calls:
         await update.effective_message.reply_text("You do not have tracked calls yet.")
         return
 
-    refresh_calls_market_data(user_calls)
+    refresh_calls_market_data(live_calls)
     metrics = derive_user_metrics(user_calls)
     rug = derive_rug_stats(user_calls)
 
@@ -2167,13 +2302,12 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     status_message = await update.effective_message.reply_text("Analyzing group performance...")
     time_filter, time_text = _resolve_time_filter(context)
-    query = {**accepted_call_filter(chat_id), **time_filter}
-    all_calls = list(calls_collection.find(query))
+    live_calls, archived_calls, all_calls = load_calls_for_stats(chat_id, time_filter, include_archive=True)
     if not all_calls:
         await status_message.edit_text(f"No calls tracked in this group for {time_text}")
         return
 
-    refresh_calls_market_data(all_calls)
+    refresh_calls_market_data(live_calls)
 
     total_calls = len(all_calls)
     unique_callers = set(get_caller_key(call) for call in all_calls)
@@ -2251,7 +2385,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     group_key = ensure_group_key(chat_id) or "N/A"
 
     base = {"chat_id": chat_id}
-    accepted = calls_collection.count_documents({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]})
+    accepted = (
+        calls_collection.count_documents({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]})
+        + calls_archive_collection.count_documents({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]})
+    )
     rejected = calls_collection.count_documents({**base, "status": "rejected"})
 
     reason_counts = list(
@@ -2290,7 +2427,10 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     avg_delay = delay_stats[0]["avg_delay"] if delay_stats else 0
     max_delay = delay_stats[0]["max_delay"] if delay_stats else 0
 
-    recent_calls = list(calls_collection.find({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]}))
+    recent_calls = (
+        list(calls_collection.find({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]}))
+        + list(calls_archive_collection.find({**base, "$or": [{"status": "accepted"}, {"status": {"$exists": False}}]}))
+    )
     user_calls = {}
     for call in recent_calls:
         key = get_caller_key(call)
@@ -2419,12 +2559,12 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, time_arg: str = "7d"):
     fake_context = type("obj", (), {"args": [time_arg]})()
     time_filter, time_text = _resolve_time_filter(fake_context)
-    calls = list(calls_collection.find(_accepted_query(chat_id, time_filter)))
+    live_calls, archived_calls, calls = load_calls_for_stats(chat_id, time_filter, include_archive=True)
     if not calls:
         await context.bot.send_message(chat_id=chat_id, text=f"No data for {time_text} to chart.")
         return
 
-    refresh_calls_market_data(calls)
+    refresh_calls_market_data(live_calls)
     metrics = derive_user_metrics(calls)
     chart_url = build_performance_chart_url(
         f"Group Mini Chart ({time_text})",
@@ -2443,16 +2583,22 @@ async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int
 
 
 async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, caller_id: int):
-    calls = list(
+    live_calls = list(
         calls_collection.find(_accepted_query(chat_id, {"caller_id": caller_id}))
         .sort("timestamp", -1)
         .limit(50)
     )
+    archived_calls = list(
+        calls_archive_collection.find(_accepted_query(chat_id, {"caller_id": caller_id}))
+        .sort("timestamp", -1)
+        .limit(200)
+    )
+    calls = sorted(live_calls + archived_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)[:50]
     if not calls:
         await context.bot.send_message(chat_id=chat_id, text="No caller data found for chart.")
         return
 
-    refresh_calls_market_data(calls)
+    refresh_calls_market_data(live_calls)
     metrics = derive_user_metrics(calls)
     caller_name = calls[0].get("caller_name", f"User {caller_id}")
     chart_url = build_performance_chart_url(
@@ -2474,7 +2620,10 @@ async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: in
 
 def top_caller_id(chat_id: int, lookback_days: int = 7):
     cutoff = utc_now() - timedelta(days=lookback_days)
-    calls = list(calls_collection.find(_accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})))
+    calls = (
+        list(calls_collection.find(_accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})))
+        + list(calls_archive_collection.find(_accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})))
+    )
     if not calls:
         return None
     user_calls = {}
