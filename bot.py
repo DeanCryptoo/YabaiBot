@@ -139,6 +139,29 @@ def stars_from_score(score):
     return ("★" * filled) + ("☆" * (5 - filled))
 
 
+def delete_callback_data(user_id):
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        uid = 0
+    return f"delm:{uid}"
+
+
+def delete_button_markup(user_id):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🗑 Delete", callback_data=delete_callback_data(user_id))]]
+    )
+
+
+def with_delete_button(reply_markup, user_id):
+    delete_row = [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback_data(user_id))]
+    if reply_markup is None:
+        return InlineKeyboardMarkup([delete_row])
+    rows = [list(row) for row in reply_markup.inline_keyboard]
+    rows.append(delete_row)
+    return InlineKeyboardMarkup(rows)
+
+
 def _text_width(draw, text, font):
     if not text:
         return 0
@@ -1175,6 +1198,7 @@ async def run_streak_scan_for_chat(bot, chat_id, manual=False):
                         f"🏅 Win Streak: {hot_streak}\n"
                         f"⏱ Last call inside {ACTIVE_CALL_WINDOW_HOURS}h"
                     ),
+                    reply_markup=delete_button_markup(0),
                 )
                 user_profiles_collection.update_one(
                     {"chat_id": chat_id, "user_id": user_id},
@@ -1198,6 +1222,7 @@ async def run_streak_scan_for_chat(bot, chat_id, manual=False):
                         f"🩸 Losing Streak: {cold_streak}\n"
                         f"🔎 Review before trusting new calls"
                     ),
+                    reply_markup=delete_button_markup(0),
                 )
                 user_profiles_collection.update_one(
                     {"chat_id": chat_id, "user_id": user_id},
@@ -1433,9 +1458,10 @@ async def send_daily_digest(bot, chat_id, manual=False):
             chat_id=chat_id,
             photo=digest_card,
             caption=digest_caption,
+            reply_markup=delete_button_markup(0),
         )
     else:
-        await bot.send_message(chat_id=chat_id, text=digest_text)
+        await bot.send_message(chat_id=chat_id, text=digest_text, reply_markup=delete_button_markup(0))
     settings_collection.update_one(
         {"chat_id": chat_id},
         {"$set": {"last_digest_date": today}},
@@ -1937,7 +1963,8 @@ async def _fetch_and_calculate_rankings(
     )
     if total_ranked <= 0 or not first_page_rows:
         await update.effective_message.reply_text(
-            f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked"
+            f"No one has reached the minimum {MIN_CALLS_REQUIRED} calls to be ranked",
+            reply_markup=delete_button_markup(update.effective_user.id if update.effective_user else 0),
         )
         return
 
@@ -1960,6 +1987,7 @@ async def _fetch_and_calculate_rankings(
     context.chat_data["leaderboard_total"] = total_ranked
     context.chat_data["leaderboard_highlight_label"] = highlight_label
     context.chat_data["leaderboard_highlight_text"] = highlight_text
+    context.chat_data["leaderboard_owner_id"] = (update.effective_user.id if update.effective_user else 0)
     context.chat_data["leaderboard_image_mode"] = False
 
     try:
@@ -2013,6 +2041,7 @@ def build_leaderboard_page(context, page=0):
     highlight_label = context.chat_data.get("leaderboard_highlight_label", "🔥 Best Win")
     highlight_text = context.chat_data.get("leaderboard_highlight_text", "N/A")
     image_mode = bool(context.chat_data.get("leaderboard_image_mode", False))
+    owner_id = int(context.chat_data.get("leaderboard_owner_id", 0) or 0)
     items_per_page = 6 if image_mode else 10
     if chat_id is None:
         return "Data expired. Run the command again.", None
@@ -2060,6 +2089,7 @@ def build_leaderboard_page(context, page=0):
         buttons.append(InlineKeyboardButton("Next", callback_data=f"lb_{page+1}"))
 
     reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    reply_markup = with_delete_button(reply_markup, owner_id)
     return text, reply_markup
 
 
@@ -2092,9 +2122,54 @@ async def paginate_leaderboard(update: Update, context: ContextTypes.DEFAULT_TYP
             await query.message.reply_text("Data expired. Run the command again.")
 
 
+async def delete_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query is None or query.message is None:
+        return
+
+    data = str(query.data or "")
+    try:
+        owner_id = int(data.split(":", 1)[1])
+    except (IndexError, ValueError, TypeError):
+        owner_id = 0
+
+    actor_id = query.from_user.id if query.from_user else 0
+    chat = query.message.chat
+    can_delete = bool(owner_id > 0 and actor_id == owner_id)
+
+    if not can_delete:
+        if chat and chat.type == "private":
+            can_delete = bool(owner_id <= 0 or actor_id == owner_id)
+        elif chat:
+            try:
+                can_delete = await user_is_admin(context.bot, chat.id, actor_id)
+            except Exception:
+                can_delete = False
+
+    if not can_delete:
+        await query.answer("Only requester/admin can delete this.", show_alert=True)
+        return
+
+    try:
+        await query.message.delete()
+    except Exception:
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+            await query.answer("Could not delete message; removed buttons.")
+        except Exception:
+            await query.answer("Unable to delete this message.", show_alert=True)
+        return
+
+    await query.answer("Deleted")
+
+
 async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    requester_id = update.effective_user.id if update.effective_user else 0
     if not context.args:
-        await update.effective_message.reply_text("Provide a name or @username. Example: /caller John")
+        await update.effective_message.reply_text(
+            "Provide a name or @username. Example: /caller John",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     target = " ".join(context.args).replace("@", "")
@@ -2119,7 +2194,10 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     archived_user_calls = list(calls_archive_collection.find(query).sort("timestamp", -1))
     all_user_calls = sorted(live_user_calls + archived_user_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)
     if not all_user_calls:
-        await update.effective_message.reply_text(f"No calls found for '{target}' in this group")
+        await update.effective_message.reply_text(
+            f"No calls found for '{target}' in this group",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     refresh_calls_market_data(live_user_calls)
@@ -2175,6 +2253,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_caller:{chat_id}:{caller_id}")]]
         )
+    reply_markup = with_delete_button(reply_markup, requester_id)
 
     caption = "\n".join(lines)
     avatar_image = None
@@ -2220,6 +2299,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id is None:
         return
     user = update.effective_user
+    requester_id = user.id if user else 0
 
     live_calls = list(
         calls_collection.find(
@@ -2242,7 +2322,10 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_calls = live_calls + archived_calls
 
     if not user_calls:
-        await update.effective_message.reply_text("You do not have tracked calls yet.")
+        await update.effective_message.reply_text(
+            "You do not have tracked calls yet.",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     refresh_calls_market_data(live_calls)
@@ -2288,15 +2371,20 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rug_text=f"Rug {rug['rug_count']}/{rug['total']}",
         )
         caption_text = caption if len(caption) <= 1024 else (caption[:1021] + "...")
-        await update.effective_message.reply_photo(photo=card, caption=caption_text)
+        await update.effective_message.reply_photo(
+            photo=card,
+            caption=caption_text,
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
     except Exception:
         pass
 
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(text, reply_markup=delete_button_markup(requester_id))
 
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    requester_id = update.effective_user.id if update.effective_user else 0
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
@@ -2304,7 +2392,14 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_filter, time_text = _resolve_time_filter(context)
     live_calls, archived_calls, all_calls = load_calls_for_stats(chat_id, time_filter, include_archive=True)
     if not all_calls:
-        await status_message.edit_text(f"No calls tracked in this group for {time_text}")
+        try:
+            await status_message.delete()
+        except Exception:
+            pass
+        await update.effective_message.reply_text(
+            f"No calls tracked in this group for {time_text}",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     refresh_calls_market_data(live_calls)
@@ -2349,6 +2444,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(
         [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_group:{chat_id}")]]
     )
+    reply_markup = with_delete_button(reply_markup, requester_id)
     group_avatar_image = await fetch_chat_avatar_image(context.bot, chat_id)
 
     card_image = generate_group_stats_card(
@@ -2377,6 +2473,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    requester_id = update.effective_user.id if update.effective_user else 0
 
     chat_id = await resolve_target_chat_id(update, context, admin_required=True)
     if chat_id is None:
@@ -2553,32 +2650,42 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)")
     lines.append(f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}")
 
-    await msg.reply_text("\n".join(lines))
+    await msg.reply_text("\n".join(lines), reply_markup=delete_button_markup(requester_id))
 
 
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
+    requester_id = update.effective_user.id if update.effective_user else 0
     chat_id = await resolve_target_chat_id(update, context, admin_required=True)
     if chat_id is None:
         return
 
     if not context.args:
-        await msg.reply_text("Usage: /cleardata <Nd|Nh>\nExample: /cleardata 20d")
+        await msg.reply_text(
+            "Usage: /cleardata <Nd|Nh>\nExample: /cleardata 20d",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     arg = str(context.args[0]).strip().lower()
     if len(arg) < 2 or arg[-1] not in {"d", "h"}:
-        await msg.reply_text("Invalid window. Use format like 20d or 48h.")
+        await msg.reply_text(
+            "Invalid window. Use format like 20d or 48h.",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     try:
         value = int(arg[:-1])
     except ValueError:
-        await msg.reply_text("Invalid window. Use format like 20d or 48h.")
+        await msg.reply_text(
+            "Invalid window. Use format like 20d or 48h.",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     if value <= 0:
-        await msg.reply_text("Window must be greater than 0.")
+        await msg.reply_text("Window must be greater than 0.", reply_markup=delete_button_markup(requester_id))
         return
 
     if arg.endswith("d"):
@@ -2600,16 +2707,26 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Cutoff: {cutoff.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
         f"Deleted live: {live_deleted}\n"
         f"Deleted archive: {archive_deleted}\n"
-        f"Total deleted: {total_deleted}"
+        f"Total deleted: {total_deleted}",
+        reply_markup=delete_button_markup(requester_id),
     )
 
 
-async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, time_arg: str = "7d"):
+async def send_group_mini_chart(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    time_arg: str = "7d",
+    requester_id: int = 0,
+):
     fake_context = type("obj", (), {"args": [time_arg]})()
     time_filter, time_text = _resolve_time_filter(fake_context)
     live_calls, archived_calls, calls = load_calls_for_stats(chat_id, time_filter, include_archive=True)
     if not calls:
-        await context.bot.send_message(chat_id=chat_id, text=f"No data for {time_text} to chart.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"No data for {time_text} to chart.",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     refresh_calls_market_data(live_calls)
@@ -2627,10 +2744,20 @@ async def send_group_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int
         f"💹 Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
         f"📈 Avg: {format_return(1.0 + metrics['avg_ath'])}"
     )
-    await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=chart_url,
+        caption=caption,
+        reply_markup=delete_button_markup(requester_id),
+    )
 
 
-async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: int, caller_id: int):
+async def send_caller_mini_chart(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    caller_id: int,
+    requester_id: int = 0,
+):
     live_calls = list(
         calls_collection.find(_accepted_query(chat_id, {"caller_id": caller_id}))
         .sort("timestamp", -1)
@@ -2643,7 +2770,11 @@ async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: in
     )
     calls = sorted(live_calls + archived_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)[:50]
     if not calls:
-        await context.bot.send_message(chat_id=chat_id, text="No caller data found for chart.")
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No caller data found for chart.",
+            reply_markup=delete_button_markup(requester_id),
+        )
         return
 
     refresh_calls_market_data(live_calls)
@@ -2663,7 +2794,12 @@ async def send_caller_mini_chart(context: ContextTypes.DEFAULT_TYPE, chat_id: in
         f"💹 Profitable: {metrics['profitable_rate'] * 100:.1f}%\n"
         f"📈 Avg: {format_return(1.0 + metrics['avg_ath'])} | 🔥 Best: {format_return(metrics['best_x'])}"
     )
-    await context.bot.send_photo(chat_id=chat_id, photo=chart_url, caption=caption)
+    await context.bot.send_photo(
+        chat_id=chat_id,
+        photo=chart_url,
+        caption=caption,
+        reply_markup=delete_button_markup(requester_id),
+    )
 
 
 def top_caller_id(chat_id: int, lookback_days: int = 7):
@@ -2713,6 +2849,9 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [
                 InlineKeyboardButton("⚡ Refresh All ATH Now", callback_data="admin_refresh_ath"),
             ],
+            [
+                InlineKeyboardButton("🗑 Delete", callback_data=delete_callback_data(user.id)),
+            ],
         ]
     )
     await update.effective_message.reply_text(
@@ -2735,29 +2874,40 @@ async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "admin_streak":
         count = await run_streak_scan_for_chat(context.bot, chat_id, manual=True)
         await query.message.reply_text(
-            f"🔥 STREAK TEST COMPLETE\n────────────────\nAlerts sent: {count}"
+            f"🔥 STREAK TEST COMPLETE\n────────────────\nAlerts sent: {count}",
+            reply_markup=delete_button_markup(user_id),
         )
     elif action == "admin_digest":
         await send_daily_digest(context.bot, chat_id, manual=True)
-        await query.message.reply_text("📰 DIGEST TEST COMPLETE\n────────────────\nDaily digest sent.")
+        await query.message.reply_text(
+            "📰 DIGEST TEST COMPLETE\n────────────────\nDaily digest sent.",
+            reply_markup=delete_button_markup(user_id),
+        )
     elif action == "admin_group_chart":
-        await send_group_mini_chart(context, chat_id, time_arg="7d")
+        await send_group_mini_chart(context, chat_id, time_arg="7d", requester_id=user_id)
     elif action == "admin_top_caller_chart":
         caller_id = top_caller_id(chat_id, lookback_days=7)
         if caller_id is None:
-            await query.message.reply_text("No top caller found for chart.")
+            await query.message.reply_text(
+                "No top caller found for chart.",
+                reply_markup=delete_button_markup(user_id),
+            )
             return
-        await send_caller_mini_chart(context, chat_id, caller_id)
+        await send_caller_mini_chart(context, chat_id, caller_id, requester_id=user_id)
     elif action == "admin_refresh_ath":
         stats = refresh_all_call_peaks(chat_id)
         if stats["calls"] == 0:
-            await query.message.reply_text("No tracked calls to refresh.")
+            await query.message.reply_text(
+                "No tracked calls to refresh.",
+                reply_markup=delete_button_markup(user_id),
+            )
             return
         await query.message.reply_text(
             "⚡ ATH REFRESH COMPLETE\n────────────────\n"
             f"Calls scanned: {stats['calls']}\n"
             f"Tokens scanned: {stats['tokens']}\n"
-            f"Records updated: {stats['updated']}"
+            f"Records updated: {stats['updated']}",
+            reply_markup=delete_button_markup(user_id),
         )
 
 
@@ -2772,11 +2922,11 @@ async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (TypeError, ValueError):
             await query.message.reply_text("Invalid group chart request.")
             return
-        await send_group_mini_chart(context, target_chat_id, time_arg="7d")
+        await send_group_mini_chart(context, target_chat_id, time_arg="7d", requester_id=query.from_user.id)
         return
 
     if data == "chart_group":
-        await send_group_mini_chart(context, query.message.chat_id, time_arg="7d")
+        await send_group_mini_chart(context, query.message.chat_id, time_arg="7d", requester_id=query.from_user.id)
         return
 
     if data.startswith("chart_caller:"):
@@ -2787,7 +2937,7 @@ async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except (TypeError, ValueError):
             await query.message.reply_text("Invalid caller chart request.")
             return
-        await send_caller_mini_chart(context, target_chat_id, caller_id)
+        await send_caller_mini_chart(context, target_chat_id, caller_id, requester_id=query.from_user.id)
         return
 
     if data.startswith("chart_caller_"):
@@ -2796,7 +2946,7 @@ async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await query.message.reply_text("Invalid caller chart request.")
             return
-        await send_caller_mini_chart(context, query.message.chat_id, caller_id)
+        await send_caller_mini_chart(context, query.message.chat_id, caller_id, requester_id=query.from_user.id)
 
 
 def main():
@@ -2826,6 +2976,7 @@ def main():
     app.add_handler(CommandHandler("cleardata", clear_data))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
+    app.add_handler(CallbackQueryHandler(delete_bot_message, pattern=r"^delm:"))
     app.add_handler(CallbackQueryHandler(admin_actions, pattern=r"^admin_"))
     app.add_handler(CallbackQueryHandler(chart_actions, pattern=r"^chart_"))
 
