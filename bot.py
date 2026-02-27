@@ -65,6 +65,7 @@ _dex_meta_cache = {}
 _ops_runtime = {"by_chat": {}}
 _leaderboard_sessions = {}
 _groupstats_cache = {}
+_groupstats_media_cache = {}
 _chat_avatar_cache = {}
 
 
@@ -1104,11 +1105,43 @@ def set_groupstats_cache(chat_id, time_arg, value):
             _groupstats_cache.pop(next(iter(_groupstats_cache)), None)
 
 
+def get_groupstats_media_cache(chat_id, time_arg):
+    now_ts = time.time()
+    key = _groupstats_cache_key(chat_id, time_arg)
+    row = _groupstats_media_cache.get(key)
+    if not row:
+        return None
+    if row.get("expires_at", 0) <= now_ts:
+        _groupstats_media_cache.pop(key, None)
+        return None
+    return row.get("file_id")
+
+
+def set_groupstats_media_cache(chat_id, time_arg, file_id):
+    if not file_id:
+        return
+    now_ts = time.time()
+    key = _groupstats_cache_key(chat_id, time_arg)
+    _groupstats_media_cache[key] = {
+        "file_id": str(file_id),
+        "expires_at": now_ts + GROUPSTATS_CACHE_TTL_SECONDS,
+    }
+    if len(_groupstats_media_cache) > 400:
+        stale = [k for k, row in _groupstats_media_cache.items() if row.get("expires_at", 0) <= now_ts]
+        for k in stale:
+            _groupstats_media_cache.pop(k, None)
+        while len(_groupstats_media_cache) > 400:
+            _groupstats_media_cache.pop(next(iter(_groupstats_media_cache)), None)
+
+
 def invalidate_groupstats_cache(chat_id):
     target = int(chat_id)
     keys = [k for k in _groupstats_cache.keys() if int(k[0]) == target]
     for k in keys:
         _groupstats_cache.pop(k, None)
+    media_keys = [k for k in _groupstats_media_cache.keys() if int(k[0]) == target]
+    for k in media_keys:
+        _groupstats_media_cache.pop(k, None)
 
 
 def compute_group_stats_snapshot(chat_id, time_filter):
@@ -2656,6 +2689,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     time_filter, time_text = _resolve_time_filter(context)
     time_arg_key = context.args[0].lower() if context.args else "all"
     snapshot = get_groupstats_cache(chat_id, time_arg_key)
+    snapshot_cache_hit = snapshot is not None
     if snapshot is None:
         snapshot = compute_group_stats_snapshot(chat_id, time_filter)
         if snapshot is not None:
@@ -2704,6 +2738,18 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_group:{chat_id}")]]
     )
     reply_markup = with_delete_button(reply_markup, requester_id)
+
+    if snapshot_cache_hit:
+        cached_file_id = get_groupstats_media_cache(chat_id, time_arg_key)
+        if cached_file_id:
+            await update.effective_message.reply_photo(
+                photo=cached_file_id,
+                caption=text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return
+
     group_avatar_image = await fetch_chat_avatar_image_cached(context.bot, chat_id)
 
     card_image = generate_group_stats_card(
@@ -2717,12 +2763,18 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         group_avatar_image=group_avatar_image,
     )
 
-    await update.effective_message.reply_photo(
+    sent = await update.effective_message.reply_photo(
         photo=card_image,
         caption=text,
         parse_mode="HTML",
         reply_markup=reply_markup,
     )
+    try:
+        if sent and getattr(sent, "photo", None):
+            file_id = sent.photo[-1].file_id
+            set_groupstats_media_cache(chat_id, time_arg_key, file_id)
+    except Exception:
+        pass
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
