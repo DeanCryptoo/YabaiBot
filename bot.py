@@ -3571,7 +3571,7 @@ async def delete_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=delete_button_markup(requester_id),
         )
         return
-    if not re.fullmatch(CA_REGEX, ca_raw):
+    if not ca_norm or len(ca_norm) < 20:
         await msg.reply_text(
             "Invalid CA format. Provide the full contract address.",
             reply_markup=delete_button_markup(requester_id),
