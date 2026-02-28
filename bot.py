@@ -46,6 +46,7 @@ INACTIVE_CALLER_ARCHIVE_HOURS = 24
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
 LOW_VOLUME_LOOKBACK = "h1"
 LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS = max(1, int(os.getenv("LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS", "3")))
+CALLER_LIVE_METRIC_REFRESH_LIMIT = max(20, int(os.getenv("CALLER_LIVE_METRIC_REFRESH_LIMIT", "120")))
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
 GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
@@ -98,6 +99,13 @@ def ensure_indexes():
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+def canonical_chat_id(chat_id):
+    try:
+        return int(chat_id)
+    except (TypeError, ValueError):
+        return chat_id
 
 
 def normalize_ca(ca: str) -> str:
@@ -872,6 +880,91 @@ def get_caller_key(call_doc):
     return f"legacy:{legacy_name}"
 
 
+def resolve_caller_identity(chat_id, target):
+    target_clean = str(target or "").strip().lstrip("@")
+    if not target_clean:
+        return {"target": "", "caller_id": None, "query": None}
+
+    query_by_id = None
+    try:
+        target_id = int(target_clean)
+        query_by_id = {"chat_id": chat_id, "caller_id": target_id}
+    except ValueError:
+        target_id = None
+
+    if query_by_id:
+        any_doc = calls_collection.find_one(_accepted_query(chat_id, {"caller_id": target_id}), {"caller_id": 1}) or \
+            calls_archive_collection.find_one(_accepted_query(chat_id, {"caller_id": target_id}), {"caller_id": 1})
+        if any_doc:
+            return {
+                "target": target_clean,
+                "caller_id": target_id,
+                "query": {"chat_id": chat_id, "caller_id": target_id},
+            }
+
+    profile = user_profiles_collection.find_one(
+        {
+            "chat_id": chat_id,
+            "$or": [
+                {"username": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
+                {"display_name": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
+            ],
+        },
+        {"user_id": 1},
+    ) or {}
+    profile_id = profile.get("user_id")
+    if profile_id is not None:
+        return {
+            "target": target_clean,
+            "caller_id": profile_id,
+            "query": {"chat_id": chat_id, "caller_id": profile_id},
+        }
+
+    name_query = {
+        "chat_id": chat_id,
+        "$and": [
+            {
+                "$or": [
+                    {"caller_name": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
+                    {"caller_username": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
+                ]
+            }
+        ],
+    }
+    return {
+        "target": target_clean,
+        "caller_id": None,
+        "query": name_query,
+    }
+
+
+def enrich_calls_with_live_meta(calls, limit=CALLER_LIVE_METRIC_REFRESH_LIMIT):
+    if not calls:
+        return []
+    enriched = [dict(call) for call in calls]
+    target = enriched[:max(0, int(limit))]
+    cas = []
+    seen = set()
+    for call in target:
+        ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
+        if not ca_norm or ca_norm in seen:
+            continue
+        seen.add(ca_norm)
+        cas.append(ca_norm)
+    meta_map = get_dexscreener_batch_meta(cas)
+    for call in target:
+        ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
+        meta = meta_map.get(ca_norm, {})
+        live_fdv = float(meta.get("fdv", 0) or 0)
+        if live_fdv > 0:
+            call["current_mcap"] = live_fdv
+            old_ath = float(call.get("ath_mcap", live_fdv) or live_fdv)
+            call["ath_mcap"] = max(old_ath, live_fdv)
+        if meta.get("symbol"):
+            call["token_symbol"] = meta.get("symbol")
+    return enriched
+
+
 def call_peak_x(call_doc):
     initial = float(call_doc.get("initial_mcap", 0) or 0)
     if initial <= 0:
@@ -1138,8 +1231,13 @@ def get_reputation_penalty(chat_id, caller_id):
 def get_tracked_chat_ids():
     settings_ids = settings_collection.distinct("chat_id")
     call_ids = calls_collection.distinct("chat_id")
-    ids = set(settings_ids or []) | set(call_ids or [])
-    return [chat_id for chat_id in ids if chat_id is not None]
+    merged = list(settings_ids or []) + list(call_ids or [])
+    ids = set()
+    for raw_chat_id in merged:
+        normalized = canonical_chat_id(raw_chat_id)
+        if isinstance(normalized, int):
+            ids.add(normalized)
+    return list(ids)
 
 
 def is_win_call(call_doc):
@@ -1250,6 +1348,7 @@ async def fetch_chat_avatar_image_cached(bot, chat_id):
 
 
 def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
+    chat_id = canonical_chat_id(chat_id)
     now = utc_now()
     by_chat = _ops_runtime.setdefault("by_chat", {})
     row = by_chat.setdefault(
@@ -2896,50 +2995,36 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    target = " ".join(context.args).replace("@", "")
+    target = " ".join(context.args).strip()
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
 
-    query = {
-        "chat_id": chat_id,
-        "$or": [{"status": "accepted"}, {"status": {"$exists": False}}],
-        "$and": [
-            {
-                "$or": [
-                    {"caller_name": {"$regex": f"^{re.escape(target)}$", "$options": "i"}},
-                    {"caller_username": {"$regex": f"^{re.escape(target)}$", "$options": "i"}},
-                ]
-            }
-        ],
-    }
+    identity = resolve_caller_identity(chat_id, target)
+    base_query = identity.get("query") or {"chat_id": chat_id}
+    query = _accepted_query(chat_id, {k: v for k, v in base_query.items() if k != "chat_id"})
 
     live_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
     archived_user_calls = list(calls_archive_collection.find(query).sort("timestamp", -1))
     all_user_calls = sorted(live_user_calls + archived_user_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)
     if not all_user_calls:
         await update.effective_message.reply_text(
-            f"No calls found for '{target}' in this group",
+            f"No calls found for '{identity.get('target') or target}' in this group",
             reply_markup=delete_button_markup(requester_id),
         )
         return
 
     refresh_calls_market_data(live_user_calls)
-    metrics = derive_user_metrics(all_user_calls)
-    rug = derive_rug_stats(all_user_calls)
+    enriched_calls = enrich_calls_with_live_meta(all_user_calls, limit=CALLER_LIVE_METRIC_REFRESH_LIMIT)
+    metrics = derive_user_metrics(enriched_calls)
+    rug = derive_rug_stats(enriched_calls)
 
-    recent_calls = all_user_calls[:5]
+    recent_calls = enriched_calls[:5]
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     caller_id = recent_calls[0].get("caller_id")
     win_pct = metrics["win_rate"] * 100
     caller_penalty = get_reputation_penalty(chat_id, caller_id) if caller_id is not None else 0.0
     caller_score = max(0.0, metrics["reputation"] - caller_penalty)
-    recent_cas_norm = []
-    for c in recent_calls:
-        ca_norm = c.get("ca_norm", normalize_ca(c.get("ca", "")))
-        if ca_norm:
-            recent_cas_norm.append(ca_norm)
-    recent_meta = get_dexscreener_batch_meta(recent_cas_norm)
     avg_text = format_return(1 + metrics["avg_ath"])
     best_text = format_return(metrics["best_x"])
     stars = stars_from_score(caller_score)
@@ -2967,12 +3052,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
             continue
         call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
         ca_norm = call.get("ca_norm", normalize_ca(ca))
-        meta = recent_meta.get(ca_norm, {})
-        live_fdv = float(meta.get("fdv", 0) or 0)
-        if live_fdv > 0:
-            current = live_fdv
-            ath = max(ath, live_fdv)
-        symbol = meta.get("symbol") or call.get("token_symbol", "")
+        symbol = call.get("token_symbol", "")
         token = token_label(symbol, ca)
         lines.append(
             f"• {html.escape(token)} ({call_date})\n"
@@ -3300,7 +3380,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cache_total = len(_dex_meta_cache)
     cache_live = sum(1 for entry in _dex_meta_cache.values() if entry.get("expires_at", 0) > now_ts)
 
-    runtime = _ops_runtime.get("by_chat", {}).get(chat_id, {})
+    runtime_map = _ops_runtime.get("by_chat", {})
+    runtime = (
+        runtime_map.get(chat_id)
+        or runtime_map.get(str(chat_id))
+        or runtime_map.get(canonical_chat_id(chat_id))
+        or {}
+    )
     last_heartbeat_at = runtime.get("last_heartbeat_at")
     if isinstance(last_heartbeat_at, datetime):
         last_heartbeat_text = last_heartbeat_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -3455,6 +3541,70 @@ async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "────────────────\n"
         f"Window kept: last {window_text}\n"
         f"Cutoff: {cutoff.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+        f"Deleted live: {live_deleted}\n"
+        f"Deleted archive: {archive_deleted}\n"
+        f"Total deleted: {total_deleted}",
+        reply_markup=delete_button_markup(requester_id),
+    )
+
+
+async def delete_call(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    requester_id = update.effective_user.id if update.effective_user else 0
+    chat_id = await resolve_target_chat_id(update, context, admin_required=True)
+    if chat_id is None:
+        return
+
+    if len(context.args) < 2:
+        await msg.reply_text(
+            "Usage: /delete <@name|name> <ca>\nExample: /delete @yodizm 6r...pump",
+            reply_markup=delete_button_markup(requester_id),
+        )
+        return
+
+    ca_raw = str(context.args[-1]).strip()
+    target_raw = " ".join(context.args[:-1]).strip()
+    ca_norm = normalize_ca(ca_raw)
+    if not target_raw:
+        await msg.reply_text(
+            "Missing caller target. Usage: /delete <@name|name> <ca>",
+            reply_markup=delete_button_markup(requester_id),
+        )
+        return
+    if not re.fullmatch(CA_REGEX, ca_raw):
+        await msg.reply_text(
+            "Invalid CA format. Provide the full contract address.",
+            reply_markup=delete_button_markup(requester_id),
+        )
+        return
+
+    identity = resolve_caller_identity(chat_id, target_raw)
+    base_query = identity.get("query") or {"chat_id": chat_id}
+    delete_query = _accepted_query(
+        chat_id,
+        {
+            **{k: v for k, v in base_query.items() if k != "chat_id"},
+            "ca_norm": ca_norm,
+        },
+    )
+
+    live_deleted = calls_collection.delete_many(delete_query).deleted_count
+    archive_deleted = calls_archive_collection.delete_many(delete_query).deleted_count
+    total_deleted = int(live_deleted or 0) + int(archive_deleted or 0)
+    if total_deleted > 0:
+        recompute_rollups_for_chat(chat_id)
+        settings_collection.update_one(
+            {"chat_id": chat_id},
+            {"$set": {"rollup_version": ROLLUP_SCHEMA_VERSION}},
+            upsert=True,
+        )
+        invalidate_groupstats_cache(chat_id)
+
+    await msg.reply_text(
+        "🗑 CALL DELETE RESULT\n"
+        "────────────────\n"
+        f"Caller: {identity.get('target') or target_raw}\n"
+        f"CA: {ca_norm}\n"
         f"Deleted live: {live_deleted}\n"
         f"Deleted archive: {archive_deleted}\n"
         f"Total deleted: {total_deleted}",
@@ -3724,6 +3874,7 @@ def main():
     app.add_handler(CommandHandler("adminstats", admin_stats))
     app.add_handler(CommandHandler("adminpanel", admin_panel))
     app.add_handler(CommandHandler("cleardata", clear_data))
+    app.add_handler(CommandHandler("delete", delete_call))
 
     app.add_handler(CallbackQueryHandler(paginate_leaderboard, pattern=r"^lb_"))
     app.add_handler(CallbackQueryHandler(delete_bot_message, pattern=r"^delm:"))
