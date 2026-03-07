@@ -1101,10 +1101,6 @@ def apply_rollup_delta(
             "updated_at": now,
         },
         "$setOnInsert": {
-            "calls": 0,
-            "wins": 0,
-            "profitables": 0,
-            "sum_x_peak": 0.0,
             "avg_x": 0.0,
             "win_rate": 0.0,
             "profitable_rate": 0.0,
