@@ -72,7 +72,10 @@ _leaderboard_sessions = {}
 _groupstats_cache = {}
 _groupstats_media_cache = {}
 _chat_avatar_cache = {}
-ROLLUP_SCHEMA_VERSION = 1
+ROLLUP_SCHEMA_VERSION = 2
+KICKLIST_MAX_AVG_X = 1.40
+KICKLIST_MIN_CALLS = 2
+KICKLIST_LIMIT = 20
 
 
 def ensure_indexes():
@@ -880,6 +883,17 @@ def get_caller_key(call_doc):
     return f"legacy:{legacy_name}"
 
 
+def caller_key_query(chat_id, caller_key, caller_name=None):
+    if str(caller_key or "").startswith("id:"):
+        try:
+            caller_id = int(str(caller_key).split(":", 1)[1])
+            return _accepted_query(chat_id, {"caller_id": caller_id})
+        except (TypeError, ValueError):
+            pass
+    legacy_name = str(caller_name or "")
+    return _accepted_query(chat_id, {"caller_name": {"$regex": f"^{re.escape(legacy_name)}$", "$options": "i"}})
+
+
 def resolve_caller_identity(chat_id, target):
     target_clean = str(target or "").strip().lstrip("@")
     if not target_clean:
@@ -963,6 +977,53 @@ def enrich_calls_with_live_meta(calls, limit=CALLER_LIVE_METRIC_REFRESH_LIMIT):
         if meta.get("symbol"):
             call["token_symbol"] = meta.get("symbol")
     return enriched
+
+
+def build_kick_list_text(chat_id, avg_x_threshold=KICKLIST_MAX_AVG_X, min_calls=KICKLIST_MIN_CALLS, limit=KICKLIST_LIMIT):
+    ensure_rollups_ready(chat_id)
+    rows = list(
+        caller_rollups_collection.find(
+            {
+                "chat_id": chat_id,
+                "calls": {"$gte": int(min_calls)},
+                "avg_x": {"$lt": float(avg_x_threshold)},
+            },
+            {
+                "_id": 0,
+                "caller_key": 1,
+                "caller_id": 1,
+                "name": 1,
+                "calls": 1,
+                "avg_x": 1,
+                "best_x": 1,
+                "win_rate": 1,
+            },
+        )
+        .sort([("avg_x", ASCENDING), ("calls", DESCENDING)])
+        .limit(int(limit))
+    )
+    if not rows:
+        return (
+            "Kick Watchlist\n"
+            "----------------\n"
+            f"No callers with >= {min_calls} calls and avg below {format_return(avg_x_threshold)}."
+        )
+
+    lines = [
+        "Kick Watchlist",
+        "----------------",
+        f"Avg threshold: below {format_return(avg_x_threshold)}",
+    ]
+    for idx, row in enumerate(rows, start=1):
+        caller_query = caller_key_query(chat_id, row.get("caller_key"), row.get("name"))
+        calls = list(calls_collection.find(caller_query)) + list(calls_archive_collection.find(caller_query))
+        rug = derive_rug_stats(calls)
+        lines.append(
+            f"{idx}. {row.get('name', 'Unknown')} | Calls {int(row.get('calls', 0) or 0)} | "
+            f"Avg {format_return(float(row.get('avg_x', 0) or 0))} | "
+            f"Rugs {rug['rug_count']}/{rug['total']}"
+        )
+    return "\n".join(lines)
 
 
 def call_peak_x(call_doc):
@@ -3478,7 +3539,13 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines.append(f"⏱ Avg Refresh: {avg_refresh_ms:.1f}ms (last {last_refresh_ms:.1f}ms)")
     lines.append(f"🔁 Refresh Runs: {refresh_runs} | Last Refreshed Calls: {last_refreshed_calls}")
 
-    await msg.reply_text("\n".join(lines), reply_markup=delete_button_markup(requester_id))
+    admin_stats_markup = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Kick Watchlist", callback_data="admin_kicklist")],
+            [InlineKeyboardButton("🗑 Delete", callback_data=delete_callback_data(requester_id))],
+        ]
+    )
+    await msg.reply_text("\n".join(lines), reply_markup=admin_stats_markup)
 
 
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3809,6 +3876,9 @@ async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Records updated: {stats['updated']}",
             reply_markup=delete_button_markup(user_id),
         )
+    elif action == "admin_kicklist":
+        text = build_kick_list_text(chat_id)
+        await query.message.reply_text(text, reply_markup=delete_button_markup(user_id))
 
 
 async def chart_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
