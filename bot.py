@@ -12,7 +12,7 @@ from urllib.parse import quote
 from datetime import datetime, timedelta, timezone
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from PIL import Image, ImageDraw, ImageFont
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, User
 from telegram.ext import (
     Application,
     MessageHandler,
@@ -1105,7 +1105,6 @@ def apply_rollup_delta(
             "wins": 0,
             "profitables": 0,
             "sum_x_peak": 0.0,
-            "best_x": 0.0,
             "avg_x": 0.0,
             "win_rate": 0.0,
             "profitable_rate": 0.0,
