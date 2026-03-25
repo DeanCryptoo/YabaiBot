@@ -237,6 +237,24 @@ def with_delete_button(reply_markup, user_id):
     return InlineKeyboardMarkup(rows)
 
 
+async def send_loading_message(message_obj, text):
+    if message_obj is None:
+        return None
+    try:
+        return await message_obj.reply_text(text)
+    except Exception:
+        return None
+
+
+async def clear_loading_message(message_obj):
+    if message_obj is None:
+        return
+    try:
+        await message_obj.delete()
+    except Exception:
+        pass
+
+
 def _text_width(draw, text, font):
     if not text:
         return 0
@@ -4290,14 +4308,22 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
-    await _fetch_and_calculate_rankings(update, context, is_bottom=False, target_chat_id=chat_id)
+    loading_message = await send_loading_message(update.effective_message, "Loading leaderboard...")
+    try:
+        await _fetch_and_calculate_rankings(update, context, is_bottom=False, target_chat_id=chat_id)
+    finally:
+        await clear_loading_message(loading_message)
 
 
 async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
-    await _fetch_and_calculate_rankings(update, context, is_bottom=True, target_chat_id=chat_id)
+    loading_message = await send_loading_message(update.effective_message, "Loading bottom list...")
+    try:
+        await _fetch_and_calculate_rankings(update, context, is_bottom=True, target_chat_id=chat_id)
+    finally:
+        await clear_loading_message(loading_message)
 
 
 def compose_leaderboard_page_text(
@@ -4481,7 +4507,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id is None:
         return
 
-    loading_message = await update.effective_message.reply_text("Loading caller profile...")
+    loading_message = await send_loading_message(update.effective_message, "Loading caller profile...")
     identity = resolve_caller_identity(chat_id, target)
     base_query = identity.get("query") or {"chat_id": chat_id}
     query_extra = {k: v for k, v in base_query.items() if k != "chat_id"}
@@ -4607,10 +4633,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=reply_markup)
     finally:
-        try:
-            await loading_message.delete()
-        except Exception:
-            pass
+        await clear_loading_message(loading_message)
 
 
 async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4619,6 +4642,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = update.effective_user
     requester_id = user.id if user else 0
+    loading_message = await send_loading_message(update.effective_message, "Loading your score...")
 
     live_calls = list(
         calls_collection.find(
@@ -4641,6 +4665,7 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_calls = live_calls + archived_calls
 
     if not user_calls:
+        await clear_loading_message(loading_message)
         await update.effective_message.reply_text(
             "You do not have tracked calls yet.",
             reply_markup=delete_button_markup(requester_id),
@@ -4694,11 +4719,13 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=caption_text,
             reply_markup=delete_button_markup(requester_id),
         )
+        await clear_loading_message(loading_message)
         return
     except Exception:
         pass
 
     await update.effective_message.reply_text(text, reply_markup=delete_button_markup(requester_id))
+    await clear_loading_message(loading_message)
 
 
 async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4706,6 +4733,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context, admin_required=False)
     if chat_id is None:
         return
+    loading_message = await send_loading_message(update.effective_message, "Loading group stats...")
 
     time_filter, time_text = _resolve_time_filter(context)
     time_arg_key = context.args[0].lower() if context.args else "all"
@@ -4717,6 +4745,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_groupstats_cache(chat_id, time_arg_key, snapshot)
 
     if not snapshot:
+        await clear_loading_message(loading_message)
         await update.effective_message.reply_text(
             f"No calls tracked in this group for {time_text}",
             reply_markup=delete_button_markup(requester_id),
@@ -4769,6 +4798,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=reply_markup,
             )
+            await clear_loading_message(loading_message)
             return
 
     group_avatar_image = await fetch_chat_avatar_image_cached(context.bot, chat_id)
@@ -4796,6 +4826,7 @@ async def group_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_groupstats_media_cache(chat_id, time_arg_key, file_id)
     except Exception:
         pass
+    await clear_loading_message(loading_message)
 
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4805,6 +4836,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = await resolve_target_chat_id(update, context, admin_required=True)
     if chat_id is None:
         return
+    loading_message = await send_loading_message(msg, "Loading admin stats...")
 
     group_key = ensure_group_key(chat_id) or "N/A"
 
@@ -4990,6 +5022,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
     )
     await msg.reply_text("\n".join(lines), reply_markup=admin_stats_markup)
+    await clear_loading_message(loading_message)
 
 
 async def clear_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
