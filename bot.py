@@ -55,6 +55,7 @@ DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000"))
 DEX_REQUEST_TIMEOUT_SECONDS = max(2, int(os.getenv("DEX_REQUEST_TIMEOUT_SECONDS", "5")))
 GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
 CHAT_AVATAR_CACHE_TTL_SECONDS = max(60, int(os.getenv("CHAT_AVATAR_CACHE_TTL_SECONDS", "3600")))
+USER_AVATAR_CACHE_TTL_SECONDS = max(60, int(os.getenv("USER_AVATAR_CACHE_TTL_SECONDS", "3600")))
 SCORE_SAMPLE_PRIOR_CALLS = max(1.0, float(os.getenv("SCORE_SAMPLE_PRIOR_CALLS", "8")))
 SCORE_RATE_PRIOR_CALLS = max(1.0, float(os.getenv("SCORE_RATE_PRIOR_CALLS", "6")))
 SCORE_BASELINE_WIN_RATE = float(os.getenv("SCORE_BASELINE_WIN_RATE", "0.35"))
@@ -111,6 +112,7 @@ _leaderboard_page_cache = {}
 _groupstats_cache = {}
 _groupstats_media_cache = {}
 _chat_avatar_cache = {}
+_user_avatar_cache = {}
 _historical_ath_cache = {}
 ROLLUP_SCHEMA_VERSION = 3
 KICKLIST_MAX_AVG_X = 1.40
@@ -138,6 +140,8 @@ def ensure_indexes():
     caller_rollups_collection.create_index([("chat_id", ASCENDING), ("score", DESCENDING), ("calls", DESCENDING)])
 
     user_profiles_collection.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
+    user_profiles_collection.create_index([("chat_id", ASCENDING), ("username_key", ASCENDING)])
+    user_profiles_collection.create_index([("chat_id", ASCENDING), ("display_name_key", ASCENDING)])
     settings_collection.create_index([("chat_id", ASCENDING)], unique=True)
     settings_collection.create_index([("group_key", ASCENDING)], unique=True, sparse=True)
     private_links_collection.create_index([("user_id", ASCENDING)], unique=True)
@@ -156,6 +160,10 @@ def canonical_chat_id(chat_id):
 
 def normalize_ca(ca: str) -> str:
     return ca.strip().lower()
+
+
+def normalize_lookup_key(value: str) -> str:
+    return str(value or "").strip().lower()
 
 
 def accepted_call_filter(chat_id: int):
@@ -1065,6 +1073,8 @@ def build_historical_reconcile_entries(call_docs, collection_name, protected_ids
 
 
 def update_user_profile(chat_id, user, event_type, reason=None):
+    display_name = user.full_name or user.first_name or "Unknown"
+    username = user.username or ""
     update_doc = {
         "$setOnInsert": {
             "chat_id": chat_id,
@@ -1072,8 +1082,10 @@ def update_user_profile(chat_id, user, event_type, reason=None):
             "first_seen": utc_now(),
         },
         "$set": {
-            "display_name": user.full_name or user.first_name or "Unknown",
-            "username": user.username,
+            "display_name": display_name,
+            "display_name_key": normalize_lookup_key(display_name),
+            "username": username,
+            "username_key": normalize_lookup_key(username),
             "updated_at": utc_now(),
         },
     }
@@ -1092,6 +1104,21 @@ def update_user_profile(chat_id, user, event_type, reason=None):
         update_doc,
         upsert=True,
     )
+
+
+def build_caller_badges(calls, win_rate, avg_ath, best_x):
+    badges = []
+    if best_x >= 100.0:
+        badges.append("100x Legend")
+    elif best_x >= 25.0:
+        badges.append("Moonshot")
+    elif best_x >= 10.0:
+        badges.append("Sniper")
+    if calls >= 10 and win_rate >= 0.60:
+        badges.append("High Hit Rate")
+    if calls >= 5 and avg_ath > 0:
+        badges.append("Profitable")
+    return badges
 
 
 def derive_user_metrics(calls):
@@ -1147,17 +1174,7 @@ def derive_user_metrics(calls):
         best_x=best_x,
     )
 
-    badges = []
-    if best_x >= 100.0:
-        badges.append("100x Legend")
-    elif best_x >= 25.0:
-        badges.append("Moonshot")
-    elif best_x >= 10.0:
-        badges.append("Sniper")
-    if n >= 10 and win_rate >= 0.60:
-        badges.append("High Hit Rate")
-    if n >= 5 and avg_ath > 0:
-        badges.append("Profitable")
+    badges = build_caller_badges(n, win_rate, avg_ath, best_x)
 
     return {
         "calls": n,
@@ -1253,6 +1270,7 @@ def caller_key_query(chat_id, caller_key, caller_name=None):
 
 def resolve_caller_identity(chat_id, target):
     target_clean = str(target or "").strip().lstrip("@")
+    target_key = normalize_lookup_key(target_clean)
     if not target_clean:
         return {"target": "", "caller_id": None, "query": None}
 
@@ -1277,6 +1295,8 @@ def resolve_caller_identity(chat_id, target):
         {
             "chat_id": chat_id,
             "$or": [
+                {"username_key": target_key},
+                {"display_name_key": target_key},
                 {"username": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
                 {"display_name": {"$regex": f"^{re.escape(target_clean)}$", "$options": "i"}},
             ],
@@ -1334,6 +1354,113 @@ def enrich_calls_with_live_meta(calls, limit=CALLER_LIVE_METRIC_REFRESH_LIMIT):
         if meta.get("symbol"):
             call["token_symbol"] = meta.get("symbol")
     return enriched
+
+
+def metrics_from_rollup_doc(rollup_doc):
+    if not rollup_doc:
+        return None
+    calls = int(rollup_doc.get("calls", 0) or 0)
+    if calls <= 0:
+        return None
+    avg_x = float(rollup_doc.get("avg_x", 0.0) or 0.0)
+    avg_ath = max(0.0, avg_x - 1.0)
+    win_rate = float(rollup_doc.get("win_rate", 0.0) or 0.0) / 100.0
+    profitable_rate = float(rollup_doc.get("profitable_rate", 0.0) or 0.0) / 100.0
+    best_x = float(rollup_doc.get("best_x", 0.0) or 0.0)
+    return {
+        "calls": calls,
+        "avg_now": avg_ath,
+        "avg_ath": avg_ath,
+        "win_rate": win_rate,
+        "profitable_rate": profitable_rate,
+        "reputation": float(rollup_doc.get("score", 0.0) or 0.0),
+        "best_x": best_x,
+        "badges": build_caller_badges(calls, win_rate, avg_ath, best_x),
+    }
+
+
+def fetch_recent_caller_calls(chat_id, extra_query, limit=5):
+    query = _accepted_query(chat_id, extra_query or {})
+    live_calls = list(calls_collection.find(query).sort("timestamp", -1).limit(max(1, int(limit))))
+    archived_calls = list(calls_archive_collection.find(query).sort("timestamp", -1).limit(max(1, int(limit))))
+    combined = sorted(live_calls + archived_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)
+    return combined[:max(1, int(limit))]
+
+
+def compute_caller_rug_snapshot(chat_id, extra_query):
+    match_query = _accepted_query(chat_id, extra_query or {})
+    now = utc_now()
+    age_cutoff = now - timedelta(hours=RUG_MIN_AGE_HOURS)
+    pipeline = [
+        {"$match": match_query},
+        {
+            "$project": {
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+                "timestamp": 1,
+            }
+        },
+        {
+            "$unionWith": {
+                "coll": "token_calls_archive",
+                "pipeline": [
+                    {"$match": match_query},
+                    {
+                        "$project": {
+                            "initial_mcap": 1,
+                            "ath_mcap": 1,
+                            "current_mcap": 1,
+                            "timestamp": 1,
+                        }
+                    },
+                ],
+            }
+        },
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+            }
+        },
+        {"$match": {"_initial": {"$gt": 0}}},
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {
+            "$group": {
+                "_id": None,
+                "total": {"$sum": 1},
+                "eligible": {"$sum": {"$cond": [{"$lte": ["$timestamp", age_cutoff]}, 1, 0]}},
+                "rug_count": {
+                    "$sum": {
+                        "$cond": [
+                            {
+                                "$and": [
+                                    {"$lte": ["$timestamp", age_cutoff]},
+                                    {"$lte": [{"$divide": ["$_current", "$_initial"]}, RUG_CURRENT_MAX_X]},
+                                    {"$lt": [{"$divide": ["$_peak", "$_initial"]}, RUG_ATH_MAX_X]},
+                                ]
+                            },
+                            1,
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+    ]
+    rows = list(calls_collection.aggregate(pipeline, allowDiskUse=True))
+    row = rows[0] if rows else {}
+    total = int(row.get("total", 0) or 0)
+    rug_count = int(row.get("rug_count", 0) or 0)
+    eligible = int(row.get("eligible", 0) or 0)
+    rug_rate = (rug_count / total) * 100.0 if total > 0 else 0.0
+    return {
+        "rug_rate": rug_rate,
+        "rug_count": rug_count,
+        "total": total,
+        "eligible": eligible,
+    }
 
 
 def build_kick_list_text(chat_id, avg_x_threshold=KICKLIST_MAX_AVG_X, min_calls=KICKLIST_MIN_CALLS, limit=KICKLIST_LIMIT):
@@ -2122,6 +2249,33 @@ async def fetch_chat_avatar_image_cached(bot, chat_id):
         while len(_chat_avatar_cache) > 200:
             _chat_avatar_cache.pop(next(iter(_chat_avatar_cache)), None)
     return image
+
+
+async def fetch_user_avatar_image_cached(bot, user_id):
+    now_ts = time.time()
+    cached = _user_avatar_cache.get(user_id)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return cached.get("image")
+    try:
+        photos = await bot.get_user_profile_photos(user_id=user_id, limit=1)
+        image = None
+        if photos and photos.total_count > 0 and photos.photos and photos.photos[0]:
+            file_obj = await bot.get_file(photos.photos[0][-1].file_id)
+            data = await file_obj.download_as_bytearray()
+            image = Image.open(BytesIO(data)).convert("RGB")
+        _user_avatar_cache[user_id] = {
+            "image": image,
+            "expires_at": now_ts + USER_AVATAR_CACHE_TTL_SECONDS,
+        }
+        if len(_user_avatar_cache) > 300:
+            stale_keys = [key for key, row in _user_avatar_cache.items() if row.get("expires_at", 0) <= now_ts]
+            for key in stale_keys:
+                _user_avatar_cache.pop(key, None)
+            while len(_user_avatar_cache) > 300:
+                _user_avatar_cache.pop(next(iter(_user_avatar_cache)), None)
+        return image
+    except Exception:
+        return None
 
 
 def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
@@ -4327,108 +4481,136 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if chat_id is None:
         return
 
+    loading_message = await update.effective_message.reply_text("Loading caller profile...")
     identity = resolve_caller_identity(chat_id, target)
     base_query = identity.get("query") or {"chat_id": chat_id}
-    query = _accepted_query(chat_id, {k: v for k, v in base_query.items() if k != "chat_id"})
-
-    live_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
-    archived_user_calls = list(calls_archive_collection.find(query).sort("timestamp", -1))
-    all_user_calls = sorted(live_user_calls + archived_user_calls, key=lambda c: c.get("timestamp", utc_now()), reverse=True)
-    if not all_user_calls:
-        await update.effective_message.reply_text(
-            f"No calls found for '{identity.get('target') or target}' in this group",
-            reply_markup=delete_button_markup(requester_id),
-        )
-        return
-
-    metrics = derive_user_metrics(all_user_calls)
-    rug = derive_rug_stats(all_user_calls)
-
-    recent_calls = enrich_calls_with_live_meta(all_user_calls[:5], limit=5)
-    actual_name = recent_calls[0].get("caller_name", "Unknown")
-    caller_id = recent_calls[0].get("caller_id")
-    win_pct = metrics["win_rate"] * 100
-    caller_score = float(metrics["reputation"])
-    avg_text = format_return(1 + metrics["avg_ath"])
-    best_text = format_return(metrics["best_x"])
-    stars = stars_from_score(caller_score)
-
-    lines = [
-        f"👤 {html.escape(actual_name)}  {stars}",
-        "────────────────",
-        f"📞 Calls: {metrics['calls']}",
-        f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
-        f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%",
-        f"⭐ Score: {caller_score:.1f}/100",
-        f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})",
-        f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
-        "",
-        "📚 Recent 5 Calls",
-        "────────────────",
-    ]
-
-    for call in recent_calls:
-        ca = call.get("ca", "") or call.get("ca_norm", "")
-        initial = float(call.get("initial_mcap", 0) or 0)
-        current = float(call.get("current_mcap", initial) or initial)
-        ath = float(call.get("ath_mcap", current) or current)
-        if initial <= 0:
-            continue
-        call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
-        ca_norm = call.get("ca_norm", normalize_ca(ca))
-        symbol = call.get("token_symbol", "")
-        token = token_label(symbol, ca)
-        lines.append(
-            f"• {html.escape(token)} ({call_date})\n"
-            f"   📈 Peak: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
-            f"   <code>{html.escape(ca)}</code>"
-        )
-        lines.append("────────────────")
-
-    reply_markup = None
-    if caller_id is not None:
-        reply_markup = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_caller:{chat_id}:{caller_id}")]]
-        )
-    reply_markup = with_delete_button(reply_markup, requester_id)
-
-    caption = "\n".join(lines)
-    avatar_image = None
-    if caller_id is not None:
-        try:
-            photos = await context.bot.get_user_profile_photos(user_id=caller_id, limit=1)
-            if photos and photos.total_count > 0 and photos.photos and photos.photos[0]:
-                file_obj = await context.bot.get_file(photos.photos[0][-1].file_id)
-                data = await file_obj.download_as_bytearray()
-                avatar_image = Image.open(BytesIO(data)).convert("RGB")
-        except Exception:
-            avatar_image = None
+    query_extra = {k: v for k, v in base_query.items() if k != "chat_id"}
 
     try:
-        card = generate_caller_profile_card(
-            display_name=actual_name,
-            stars=stars,
-            calls=metrics["calls"],
-            avg_text=avg_text,
-            best_text=best_text,
-            hit_rate_pct=win_pct,
-            score_value=caller_score,
-            rug_text=f"Rug {rug['rug_count']}/{rug['total']}",
-            badges_text=", ".join(metrics["badges"]) if metrics["badges"] else "None",
-            avatar_image=avatar_image,
-        )
-        caption_text = caption if len(caption) <= 1024 else (caption[:1021] + "...")
-        await update.effective_message.reply_photo(
-            photo=card,
-            caption=caption_text,
-            parse_mode="HTML",
-            reply_markup=reply_markup,
-        )
-        return
-    except Exception:
-        pass
+        recent_calls = fetch_recent_caller_calls(chat_id, query_extra, limit=5)
+        if not recent_calls:
+            await update.effective_message.reply_text(
+                f"No calls found for '{identity.get('target') or target}' in this group",
+                reply_markup=delete_button_markup(requester_id),
+            )
+            return
 
-    await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=reply_markup)
+        recent_calls = enrich_calls_with_live_meta(recent_calls, limit=5)
+        actual_name = recent_calls[0].get("caller_name", "Unknown")
+        caller_id = recent_calls[0].get("caller_id")
+        caller_key = get_caller_key(recent_calls[0])
+        rollup = caller_rollups_collection.find_one(
+            {"chat_id": chat_id, "caller_key": caller_key},
+            {
+                "_id": 0,
+                "calls": 1,
+                "avg_x": 1,
+                "best_x": 1,
+                "win_rate": 1,
+                "profitable_rate": 1,
+                "score": 1,
+            },
+        )
+        metrics = metrics_from_rollup_doc(rollup)
+        rug = compute_caller_rug_snapshot(chat_id, query_extra)
+
+        if metrics is None:
+            query = _accepted_query(chat_id, query_extra)
+            live_user_calls = list(calls_collection.find(query).sort("timestamp", -1))
+            archived_user_calls = list(calls_archive_collection.find(query).sort("timestamp", -1))
+            all_user_calls = sorted(
+                live_user_calls + archived_user_calls,
+                key=lambda c: c.get("timestamp", utc_now()),
+                reverse=True,
+            )
+            metrics = derive_user_metrics(all_user_calls)
+            rug = derive_rug_stats(all_user_calls)
+
+        win_pct = metrics["win_rate"] * 100
+        caller_score = float(metrics["reputation"])
+        avg_text = format_return(1 + metrics["avg_ath"])
+        best_text = format_return(metrics["best_x"])
+        stars = stars_from_score(caller_score)
+
+        lines = [
+            f"👤 {html.escape(actual_name)}  {stars}",
+            "────────────────",
+            f"📞 Calls: {metrics['calls']}",
+            f"📈 Avg: {avg_text} | 🔥 Best: {best_text}",
+            f"🎯 Hit Rate {WIN_MULTIPLIER:.1f}x: {win_pct:.1f}%",
+            f"⭐ Score: {caller_score:.1f}/100",
+            f"🩸 Rug Calls: {rug['rug_rate']:.1f}% ({rug['rug_count']}/{rug['total']})",
+            f"🏅 Badges: {html.escape(', '.join(metrics['badges']) if metrics['badges'] else 'None')}",
+            "",
+            "📚 Recent 5 Calls",
+            "────────────────",
+        ]
+
+        for call in recent_calls:
+            ca = call.get("ca", "") or call.get("ca_norm", "")
+            initial = float(call.get("initial_mcap", 0) or 0)
+            current = float(call.get("current_mcap", initial) or initial)
+            ath = float(call.get("ath_mcap", current) or current)
+            if initial <= 0:
+                continue
+            call_date = call.get("timestamp", utc_now()).strftime("%Y-%m-%d")
+            symbol = call.get("token_symbol", "")
+            token = token_label(symbol, ca)
+            lines.append(
+                f"• {html.escape(token)} ({call_date})\n"
+                f"   📈 Peak: {format_return(ath / initial)} | 💰 Now: {format_return(current / initial)}\n"
+                f"   <code>{html.escape(ca)}</code>"
+            )
+            lines.append("────────────────")
+
+        reply_markup = None
+        if caller_id is not None:
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("📊 Mini Chart", callback_data=f"chart_caller:{chat_id}:{caller_id}")]]
+            )
+        reply_markup = with_delete_button(reply_markup, requester_id)
+
+        caption = "\n".join(lines)
+        avatar_image = None
+        if caller_id is not None:
+            try:
+                avatar_image = await asyncio.wait_for(
+                    fetch_user_avatar_image_cached(context.bot, caller_id),
+                    timeout=1.5,
+                )
+            except Exception:
+                avatar_image = None
+
+        try:
+            card = generate_caller_profile_card(
+                display_name=actual_name,
+                stars=stars,
+                calls=metrics["calls"],
+                avg_text=avg_text,
+                best_text=best_text,
+                hit_rate_pct=win_pct,
+                score_value=caller_score,
+                rug_text=f"Rug {rug['rug_count']}/{rug['total']}",
+                badges_text=", ".join(metrics["badges"]) if metrics["badges"] else "None",
+                avatar_image=avatar_image,
+            )
+            caption_text = caption if len(caption) <= 1024 else (caption[:1021] + "...")
+            await update.effective_message.reply_photo(
+                photo=card,
+                caption=caption_text,
+                parse_mode="HTML",
+                reply_markup=reply_markup,
+            )
+            return
+        except Exception:
+            pass
+
+        await update.effective_message.reply_text(caption, parse_mode="HTML", reply_markup=reply_markup)
+    finally:
+        try:
+            await loading_message.delete()
+        except Exception:
+            pass
 
 
 async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
