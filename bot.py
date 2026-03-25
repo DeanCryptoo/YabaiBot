@@ -52,6 +52,7 @@ LOW_VOLUME_STASH_MIN_AGE_HOURS = max(0.0, float(os.getenv("LOW_VOLUME_STASH_MIN_
 CALLER_LIVE_METRIC_REFRESH_LIMIT = max(20, int(os.getenv("CALLER_LIVE_METRIC_REFRESH_LIMIT", "120")))
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
+DEX_REQUEST_TIMEOUT_SECONDS = max(2, int(os.getenv("DEX_REQUEST_TIMEOUT_SECONDS", "5")))
 GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
 CHAT_AVATAR_CACHE_TTL_SECONDS = max(60, int(os.getenv("CHAT_AVATAR_CACHE_TTL_SECONDS", "3600")))
 SCORE_SAMPLE_PRIOR_CALLS = max(1.0, float(os.getenv("SCORE_SAMPLE_PRIOR_CALLS", "8")))
@@ -74,7 +75,9 @@ RUNNER_PROTECT_MAX_CALLS = max(10, int(os.getenv("RUNNER_PROTECT_MAX_CALLS", "80
 RUNNER_PROTECT_MAX_AGE_HOURS = max(24, int(os.getenv("RUNNER_PROTECT_MAX_AGE_HOURS", "96")))
 RUNNER_REPOST_BOOST_HOURS = max(1, int(os.getenv("RUNNER_REPOST_BOOST_HOURS", "24")))
 LEADERBOARD_CACHE_TTL_SECONDS = max(5, int(os.getenv("LEADERBOARD_CACHE_TTL_SECONDS", "20")))
+DEFAULT_LEADERBOARD_WINDOW = (os.getenv("DEFAULT_LEADERBOARD_WINDOW") or "30d").strip().lower()
 DAILY_ROLLUP_REPAIR_HOUR_UTC = min(23, max(0, int(os.getenv("DAILY_ROLLUP_REPAIR_HOUR_UTC", "3"))))
+REFRESH_MAINTENANCE_INTERVAL_SECONDS = max(600, int(os.getenv("REFRESH_MAINTENANCE_INTERVAL_SECONDS", "3600")))
 SOLANA_TRACKER_API_KEY = (os.getenv("SOLANA_TRACKER_API_KEY") or "").strip()
 HISTORICAL_ATH_PROVIDER = (os.getenv("HISTORICAL_ATH_PROVIDER") or ("solanatracker" if SOLANA_TRACKER_API_KEY else "none")).strip().lower()
 HISTORICAL_ATH_ENABLED = HISTORICAL_ATH_PROVIDER == "solanatracker" and bool(SOLANA_TRACKER_API_KEY)
@@ -808,7 +811,7 @@ def get_dexscreener_batch_meta(cas_list):
         url = f"https://api.dexscreener.com/latest/dex/tokens/{','.join(chunk)}"
         chunk_map = {}
         try:
-            response = requests.get(url, timeout=10)
+            response = requests.get(url, timeout=DEX_REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             payload = response.json()
             if payload and payload.get("pairs"):
@@ -2146,6 +2149,18 @@ def record_refresh_runtime(chat_id, refresh_duration_ms, refreshed_calls):
     row["last_refreshed_calls"] = int(refreshed_calls or 0)
 
 
+def should_run_refresh_maintenance(chat_id, now=None):
+    chat_id = canonical_chat_id(chat_id)
+    now = _to_utc_datetime(now) or utc_now()
+    by_chat = _ops_runtime.setdefault("by_chat", {})
+    row = by_chat.setdefault(chat_id, {})
+    last_run = _to_utc_datetime(row.get("last_refresh_maintenance_at"))
+    if last_run and (now - last_run).total_seconds() < REFRESH_MAINTENANCE_INTERVAL_SECONDS:
+        return False
+    row["last_refresh_maintenance_at"] = now
+    return True
+
+
 def save_leaderboard_session(message_obj, state):
     if not message_obj:
         return
@@ -2686,44 +2701,54 @@ def refresh_archived_calls_market_data(calls):
 
 
 def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
-    seeded_metadata = seed_refresh_queue_metadata(chat_id)
+    now = utc_now()
+    run_maintenance = should_run_refresh_maintenance(chat_id, now=now)
+    seeded_metadata = seed_refresh_queue_metadata(chat_id) if run_maintenance else 0
     protected_ids = select_runner_protected_ids(
         chat_id,
         lookback_days=max(lookback_days, REFRESH_QUEUE_LOOKBACK_DAYS),
         limit=RUNNER_PROTECT_MAX_CALLS,
     )
-    protected_ids.update(
-        select_priority_ath_call_ids(chat_id, lookback_days=lookback_days, limit=ATH_PRIORITY_KEEP_MAX_CALLS)
-    )
     reactivated_count = reactivate_priority_calls(protected_ids)
-    archived_inactive = archive_inactive_callers(
-        chat_id,
-        inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS,
-        limit=5000,
-        protected_ids=protected_ids,
-    )
-    stashed_count = stash_low_priority_calls(
-        chat_id,
-        active_limit=ACTIVE_LIVE_CALLS_PER_CHAT,
-        protected_ids=protected_ids,
-    )
-    priority_stash_cutoff = utc_now() - timedelta(hours=PRIORITY_STASH_ARCHIVE_MIN_AGE_HOURS)
-    archived_old = archive_stashed_calls(
-        chat_id,
-        reason="priority_queue",
-        limit=1000,
-        older_than=priority_stash_cutoff,
-        protected_ids=protected_ids,
-    )
-    migrated_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000, protected_ids=protected_ids)
-    low_volume_cutoff = utc_now() - timedelta(hours=LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS)
-    archived_low_pre = archive_stashed_calls(
-        chat_id,
-        reason="low_volume",
-        limit=1000,
-        older_than=low_volume_cutoff,
-        protected_ids=protected_ids,
-    )
+    archived_inactive = 0
+    stashed_count = 0
+    archived_old = 0
+    migrated_old = 0
+    archived_low_pre = 0
+    archived_low_post = 0
+    if run_maintenance:
+        protected_ids.update(
+            select_priority_ath_call_ids(chat_id, lookback_days=lookback_days, limit=ATH_PRIORITY_KEEP_MAX_CALLS)
+        )
+        reactivated_count += reactivate_priority_calls(protected_ids)
+        archived_inactive = archive_inactive_callers(
+            chat_id,
+            inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS,
+            limit=5000,
+            protected_ids=protected_ids,
+        )
+        stashed_count = stash_low_priority_calls(
+            chat_id,
+            active_limit=ACTIVE_LIVE_CALLS_PER_CHAT,
+            protected_ids=protected_ids,
+        )
+        priority_stash_cutoff = now - timedelta(hours=PRIORITY_STASH_ARCHIVE_MIN_AGE_HOURS)
+        archived_old = archive_stashed_calls(
+            chat_id,
+            reason="priority_queue",
+            limit=1000,
+            older_than=priority_stash_cutoff,
+            protected_ids=protected_ids,
+        )
+        migrated_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000, protected_ids=protected_ids)
+        low_volume_cutoff = now - timedelta(hours=LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS)
+        archived_low_pre = archive_stashed_calls(
+            chat_id,
+            reason="low_volume",
+            limit=1000,
+            older_than=low_volume_cutoff,
+            protected_ids=protected_ids,
+        )
     refresh_limit = max(1, min(int(limit or REFRESH_QUEUE_MAX_CALLS_PER_CHAT), REFRESH_QUEUE_MAX_CALLS_PER_CHAT))
     calls = load_due_refresh_calls(
         chat_id,
@@ -2746,7 +2771,7 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
     refreshed_count = refresh_calls_market_data(
         calls,
         include_stashed=False,
-        apply_stash_policy=True,
+        apply_stash_policy=run_maintenance,
         protected_ids=protected_ids,
     )
     live_hist_stats = {"checked": 0, "updated": 0}
@@ -2780,13 +2805,14 @@ def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limi
                 limit=HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS,
                 force=False,
             )
-    archived_low_post = archive_stashed_calls(
-        chat_id,
-        reason="low_volume",
-        limit=1000,
-        older_than=low_volume_cutoff,
-        protected_ids=protected_ids,
-    )
+    if run_maintenance:
+        archived_low_post = archive_stashed_calls(
+            chat_id,
+            reason="low_volume",
+            limit=1000,
+            older_than=low_volume_cutoff,
+            protected_ids=protected_ids,
+        )
     if (
         seeded_metadata > 0
         or reactivated_count > 0
@@ -4011,7 +4037,13 @@ async def _fetch_and_calculate_rankings(
     target_chat_id=None,
 ):
     chat_id = int(target_chat_id) if target_chat_id is not None else update.effective_chat.id
-    time_filter, time_text = _resolve_time_filter(context)
+    if not context.args and not is_bottom and DEFAULT_LEADERBOARD_WINDOW:
+        default_context = type("obj", (), {"args": [DEFAULT_LEADERBOARD_WINDOW]})()
+        time_filter, time_text = _resolve_time_filter(default_context)
+        time_arg_key = DEFAULT_LEADERBOARD_WINDOW
+    else:
+        time_filter, time_text = _resolve_time_filter(context)
+        time_arg_key = str(context.args[0]).strip().lower() if context.args else "all"
     first_page_rows, total_ranked = fetch_ranked_leaderboard_page(
         chat_id=chat_id,
         time_filter=time_filter,
@@ -4028,7 +4060,6 @@ async def _fetch_and_calculate_rankings(
 
     snapshot = None
     if not is_bottom:
-        time_arg_key = str(context.args[0]).strip().lower() if context.args else "all"
         snapshot = get_groupstats_cache(chat_id, time_arg_key)
 
     if is_bottom:
@@ -4041,7 +4072,9 @@ async def _fetch_and_calculate_rankings(
         highlight_label = "🔥 Best Win"
         highlight_text = best_win_text_from_snapshot(snapshot)
         if highlight_text == "N/A":
-            highlight_text = fetch_best_win_text(chat_id, time_filter)
+            top_row = first_page_rows[0]
+            highlight_label = "🔥 Top Caller Best"
+            highlight_text = f"{format_return(top_row['best_x'])} by {top_row['name']}"
 
     context.chat_data["leaderboard_chat_id"] = chat_id
     context.chat_data["leaderboard_time_filter"] = time_filter
@@ -4308,12 +4341,10 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    refresh_calls_market_data(live_user_calls)
-    enriched_calls = enrich_calls_with_live_meta(all_user_calls, limit=CALLER_LIVE_METRIC_REFRESH_LIMIT)
-    metrics = derive_user_metrics(enriched_calls)
-    rug = derive_rug_stats(enriched_calls)
+    metrics = derive_user_metrics(all_user_calls)
+    rug = derive_rug_stats(all_user_calls)
 
-    recent_calls = enriched_calls[:5]
+    recent_calls = enrich_calls_with_live_meta(all_user_calls[:5], limit=5)
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     caller_id = recent_calls[0].get("caller_id")
     win_pct = metrics["win_rate"] * 100
