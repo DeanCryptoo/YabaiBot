@@ -42,15 +42,50 @@ RUG_MIN_AGE_HOURS = 12
 ATH_TRACK_WINDOW_DAYS = 7
 ATH_TRACK_MAX_CALLS_PER_CHAT = 800
 HEARTBEAT_CALLS_PER_CALLER = 2
+ATH_PRIORITY_KEEP_MAX_CALLS = max(0, int(os.getenv("ATH_PRIORITY_KEEP_MAX_CALLS", "40")))
+ATH_PRIORITY_MIN_X = max(1.0, float(os.getenv("ATH_PRIORITY_MIN_X", "2.0")))
 INACTIVE_CALLER_ARCHIVE_HOURS = 24
 LOW_VOLUME_STASH_THRESHOLD = 1000.0
 LOW_VOLUME_LOOKBACK = "h1"
 LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS = max(1, int(os.getenv("LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS", "3")))
+LOW_VOLUME_STASH_MIN_AGE_HOURS = max(0.0, float(os.getenv("LOW_VOLUME_STASH_MIN_AGE_HOURS", "1")))
 CALLER_LIVE_METRIC_REFRESH_LIMIT = max(20, int(os.getenv("CALLER_LIVE_METRIC_REFRESH_LIMIT", "120")))
 DEX_CACHE_TTL_SECONDS = max(5, int(os.getenv("DEX_CACHE_TTL_SECONDS", "20")))
 DEX_CACHE_MAX_ENTRIES = max(200, int(os.getenv("DEX_CACHE_MAX_ENTRIES", "4000")))
 GROUPSTATS_CACHE_TTL_SECONDS = max(10, int(os.getenv("GROUPSTATS_CACHE_TTL_SECONDS", "45")))
 CHAT_AVATAR_CACHE_TTL_SECONDS = max(60, int(os.getenv("CHAT_AVATAR_CACHE_TTL_SECONDS", "3600")))
+SCORE_SAMPLE_PRIOR_CALLS = max(1.0, float(os.getenv("SCORE_SAMPLE_PRIOR_CALLS", "8")))
+SCORE_RATE_PRIOR_CALLS = max(1.0, float(os.getenv("SCORE_RATE_PRIOR_CALLS", "6")))
+SCORE_BASELINE_WIN_RATE = float(os.getenv("SCORE_BASELINE_WIN_RATE", "0.35"))
+SCORE_BASELINE_PROFITABLE_RATE = float(os.getenv("SCORE_BASELINE_PROFITABLE_RATE", "0.45"))
+SCORE_AVG_SOFTCAP_X = max(1.5, float(os.getenv("SCORE_AVG_SOFTCAP_X", "4.0")))
+SCORE_BEST_SOFTCAP_X = max(2.0, float(os.getenv("SCORE_BEST_SOFTCAP_X", "20.0")))
+REFRESH_QUEUE_LOOKBACK_DAYS = max(7, int(os.getenv("REFRESH_QUEUE_LOOKBACK_DAYS", "21")))
+REFRESH_QUEUE_MAX_CALLS_PER_CHAT = max(40, int(os.getenv("REFRESH_QUEUE_MAX_CALLS_PER_CHAT", "120")))
+ACTIVE_LIVE_CALLS_PER_CHAT = max(40, int(os.getenv("ACTIVE_LIVE_CALLS_PER_CHAT", "180")))
+GLOBAL_STASH_MIN_AGE_HOURS = max(1, int(os.getenv("GLOBAL_STASH_MIN_AGE_HOURS", "2")))
+PRIORITY_STASH_ARCHIVE_MIN_AGE_HOURS = max(1, int(os.getenv("PRIORITY_STASH_ARCHIVE_MIN_AGE_HOURS", "12")))
+HOT_REFRESH_INTERVAL_SECONDS = max(60, int(os.getenv("HOT_REFRESH_INTERVAL_SECONDS", "120")))
+WARM_REFRESH_INTERVAL_SECONDS = max(HOT_REFRESH_INTERVAL_SECONDS, int(os.getenv("WARM_REFRESH_INTERVAL_SECONDS", "300")))
+NORMAL_REFRESH_INTERVAL_SECONDS = max(WARM_REFRESH_INTERVAL_SECONDS, int(os.getenv("NORMAL_REFRESH_INTERVAL_SECONDS", "600")))
+COLD_REFRESH_INTERVAL_SECONDS = max(NORMAL_REFRESH_INTERVAL_SECONDS, int(os.getenv("COLD_REFRESH_INTERVAL_SECONDS", "1800")))
+RUNNER_PROTECT_MIN_X = max(1.1, float(os.getenv("RUNNER_PROTECT_MIN_X", "1.5")))
+RUNNER_PROTECT_MAX_CALLS = max(10, int(os.getenv("RUNNER_PROTECT_MAX_CALLS", "80")))
+RUNNER_PROTECT_MAX_AGE_HOURS = max(24, int(os.getenv("RUNNER_PROTECT_MAX_AGE_HOURS", "96")))
+RUNNER_REPOST_BOOST_HOURS = max(1, int(os.getenv("RUNNER_REPOST_BOOST_HOURS", "24")))
+LEADERBOARD_CACHE_TTL_SECONDS = max(5, int(os.getenv("LEADERBOARD_CACHE_TTL_SECONDS", "20")))
+DAILY_ROLLUP_REPAIR_HOUR_UTC = min(23, max(0, int(os.getenv("DAILY_ROLLUP_REPAIR_HOUR_UTC", "3"))))
+SOLANA_TRACKER_API_KEY = (os.getenv("SOLANA_TRACKER_API_KEY") or "").strip()
+HISTORICAL_ATH_PROVIDER = (os.getenv("HISTORICAL_ATH_PROVIDER") or ("solanatracker" if SOLANA_TRACKER_API_KEY else "none")).strip().lower()
+HISTORICAL_ATH_ENABLED = HISTORICAL_ATH_PROVIDER == "solanatracker" and bool(SOLANA_TRACKER_API_KEY)
+HISTORICAL_ATH_REQUEST_TIMEOUT_SECONDS = max(3, int(os.getenv("HISTORICAL_ATH_REQUEST_TIMEOUT_SECONDS", "8")))
+HISTORICAL_ATH_CACHE_TTL_SECONDS = max(15, int(os.getenv("HISTORICAL_ATH_CACHE_TTL_SECONDS", "120")))
+HISTORICAL_ATH_RECHECK_MINUTES = max(10, int(os.getenv("HISTORICAL_ATH_RECHECK_MINUTES", "60")))
+HISTORICAL_ATH_MIN_CALL_AGE_SECONDS = max(60, int(os.getenv("HISTORICAL_ATH_MIN_CALL_AGE_SECONDS", "180")))
+HISTORICAL_ATH_HEARTBEAT_MAX_CALLS = max(0, int(os.getenv("HISTORICAL_ATH_HEARTBEAT_MAX_CALLS", "18")))
+HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS = max(0, int(os.getenv("HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS", "8")))
+HISTORICAL_ATH_MANUAL_MAX_CALLS = max(0, int(os.getenv("HISTORICAL_ATH_MANUAL_MAX_CALLS", "120")))
+HISTORICAL_ATH_ARCHIVE_LOOKBACK_DAYS = max(1, int(os.getenv("HISTORICAL_ATH_ARCHIVE_LOOKBACK_DAYS", "30")))
 
 if not TOKEN or not MONGO_URI:
     raise ValueError("Missing TELEGRAM_TOKEN or MONGO_URI environment variables")
@@ -69,10 +104,12 @@ CA_REGEX = r"\b(0x[a-fA-F0-9]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b"
 _dex_meta_cache = {}
 _ops_runtime = {"by_chat": {}}
 _leaderboard_sessions = {}
+_leaderboard_page_cache = {}
 _groupstats_cache = {}
 _groupstats_media_cache = {}
 _chat_avatar_cache = {}
-ROLLUP_SCHEMA_VERSION = 2
+_historical_ath_cache = {}
+ROLLUP_SCHEMA_VERSION = 3
 KICKLIST_MAX_AVG_X = 1.40
 KICKLIST_MIN_CALLS = 2
 KICKLIST_LIMIT = 20
@@ -87,12 +124,15 @@ def ensure_indexes():
     calls_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("chat_id", ASCENDING), ("is_stashed", ASCENDING), ("timestamp", DESCENDING)])
     calls_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
+    calls_collection.create_index([("chat_id", ASCENDING), ("is_stashed", ASCENDING), ("next_refresh_at", ASCENDING)])
+    calls_collection.create_index([("chat_id", ASCENDING), ("is_stashed", ASCENDING), ("refresh_priority", DESCENDING), ("next_refresh_at", ASCENDING)])
     calls_collection.create_index([("message_id", ASCENDING), ("chat_id", ASCENDING)])
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("caller_id", ASCENDING), ("timestamp", DESCENDING)])
     calls_archive_collection.create_index([("chat_id", ASCENDING), ("ca_norm", ASCENDING)])
     caller_rollups_collection.create_index([("chat_id", ASCENDING), ("caller_key", ASCENDING)], unique=True)
     caller_rollups_collection.create_index([("chat_id", ASCENDING), ("avg_x", DESCENDING), ("calls", DESCENDING)])
+    caller_rollups_collection.create_index([("chat_id", ASCENDING), ("score", DESCENDING), ("calls", DESCENDING)])
 
     user_profiles_collection.create_index([("chat_id", ASCENDING), ("user_id", ASCENDING)], unique=True)
     settings_collection.create_index([("chat_id", ASCENDING)], unique=True)
@@ -256,6 +296,126 @@ def format_return(x_value):
     if abs(pct) < 0.05:
         pct = 0.0
     return f"{pct:.1f}%"
+
+
+SCORE_BASELINE_WIN_RATE = clamp(SCORE_BASELINE_WIN_RATE, 0.0, 1.0)
+SCORE_BASELINE_PROFITABLE_RATE = clamp(SCORE_BASELINE_PROFITABLE_RATE, 0.0, 1.0)
+
+
+def smooth_rate(observed_rate, calls, baseline_rate, prior_calls=SCORE_RATE_PRIOR_CALLS):
+    calls = max(0.0, float(calls or 0.0))
+    observed_rate = clamp(float(observed_rate or 0.0), 0.0, 1.0)
+    baseline_rate = clamp(float(baseline_rate or 0.0), 0.0, 1.0)
+    prior_calls = max(1.0, float(prior_calls or SCORE_RATE_PRIOR_CALLS))
+    return ((observed_rate * calls) + (baseline_rate * prior_calls)) / (calls + prior_calls)
+
+
+def sample_confidence(calls, prior_calls=SCORE_SAMPLE_PRIOR_CALLS):
+    calls = max(0.0, float(calls or 0.0))
+    prior_calls = max(1.0, float(prior_calls or SCORE_SAMPLE_PRIOR_CALLS))
+    return calls / (calls + prior_calls)
+
+
+def compute_performance_score(calls, avg_x, win_rate, profitable_rate, best_x):
+    calls = max(0.0, float(calls or 0.0))
+    if calls <= 0:
+        return 0.0
+
+    avg_x = max(0.0, float(avg_x or 0.0))
+    best_x = max(0.0, float(best_x or 0.0))
+    win_rate = clamp(float(win_rate or 0.0), 0.0, 1.0)
+    profitable_rate = clamp(float(profitable_rate or 0.0), 0.0, 1.0)
+
+    conf = sample_confidence(calls)
+    adjusted_avg_x = 1.0 + ((avg_x - 1.0) * conf)
+    avg_component = clamp((adjusted_avg_x - 1.0) / max(0.1, SCORE_AVG_SOFTCAP_X - 1.0), 0.0, 1.0)
+    win_component = smooth_rate(win_rate, calls, SCORE_BASELINE_WIN_RATE)
+    profitable_component = smooth_rate(profitable_rate, calls, SCORE_BASELINE_PROFITABLE_RATE)
+    best_component = clamp((max(best_x, 1.0) - 1.0) / max(0.1, SCORE_BEST_SOFTCAP_X - 1.0), 0.0, 1.0)
+
+    score = 100.0 * (
+        0.35 * avg_component
+        + 0.20 * win_component
+        + 0.20 * profitable_component
+        + 0.20 * conf
+        + 0.05 * best_component
+    )
+    return clamp(score, 0.0, 100.0)
+
+
+def _mongo_clamp_expr(expr, low=0.0, high=1.0):
+    return {"$min": [high, {"$max": [low, expr]}]}
+
+
+def mongo_performance_score_expr(calls_expr, wins_expr, profitables_expr, avg_x_expr, best_x_expr):
+    sample_expr = {
+        "$cond": [
+            {"$gt": [calls_expr, 0]},
+            {"$divide": [calls_expr, {"$add": [calls_expr, SCORE_SAMPLE_PRIOR_CALLS]}]},
+            0,
+        ]
+    }
+    adjusted_avg_expr = {
+        "$add": [
+            1.0,
+            {
+                "$multiply": [
+                    {"$subtract": [avg_x_expr, 1.0]},
+                    sample_expr,
+                ]
+            },
+        ]
+    }
+    avg_component_expr = _mongo_clamp_expr(
+        {"$divide": [{"$subtract": [adjusted_avg_expr, 1.0]}, max(0.1, SCORE_AVG_SOFTCAP_X - 1.0)]}
+    )
+    win_component_expr = {
+        "$cond": [
+            {"$gt": [calls_expr, 0]},
+            {
+                "$divide": [
+                    {"$add": [wins_expr, SCORE_BASELINE_WIN_RATE * SCORE_RATE_PRIOR_CALLS]},
+                    {"$add": [calls_expr, SCORE_RATE_PRIOR_CALLS]},
+                ]
+            },
+            0,
+        ]
+    }
+    profitable_component_expr = {
+        "$cond": [
+            {"$gt": [calls_expr, 0]},
+            {
+                "$divide": [
+                    {"$add": [profitables_expr, SCORE_BASELINE_PROFITABLE_RATE * SCORE_RATE_PRIOR_CALLS]},
+                    {"$add": [calls_expr, SCORE_RATE_PRIOR_CALLS]},
+                ]
+            },
+            0,
+        ]
+    }
+    best_component_expr = _mongo_clamp_expr(
+        {"$divide": [{"$subtract": [{"$max": [best_x_expr, 1.0]}, 1.0]}, max(0.1, SCORE_BEST_SOFTCAP_X - 1.0)]}
+    )
+    return {
+        "$cond": [
+            {"$gt": [calls_expr, 0]},
+            {
+                "$multiply": [
+                    100.0,
+                    {
+                        "$add": [
+                            {"$multiply": [0.35, avg_component_expr]},
+                            {"$multiply": [0.20, win_component_expr]},
+                            {"$multiply": [0.20, profitable_component_expr]},
+                            {"$multiply": [0.20, sample_expr]},
+                            {"$multiply": [0.05, best_component_expr]},
+                        ]
+                    },
+                ]
+            },
+            0,
+        ]
+    }
 
 
 def token_label(symbol, ca):
@@ -703,6 +863,204 @@ def get_dexscreener_batch(cas_list):
     return {addr: data["fdv"] for addr, data in meta.items()}
 
 
+def _to_utc_datetime(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return None
+
+
+def _historical_ath_cache_key(ca_norm, time_from, time_to):
+    return str(ca_norm or "").strip().lower(), int(time_from or 0), int(int(time_to or 0) // 300)
+
+
+def get_solanatracker_ath_range(ca_norm, time_from, time_to):
+    if not HISTORICAL_ATH_ENABLED:
+        return None
+
+    ca_norm = normalize_ca(ca_norm or "")
+    time_from = int(time_from or 0)
+    time_to = int(time_to or 0)
+    if not ca_norm or time_from <= 0 or time_to <= time_from:
+        return None
+
+    now_ts = time.time()
+    cache_key = _historical_ath_cache_key(ca_norm, time_from, time_to)
+    cached = _historical_ath_cache.get(cache_key)
+    if cached and cached.get("expires_at", 0) > now_ts:
+        return cached.get("value")
+
+    value = None
+    try:
+        response = requests.get(
+            "https://data.solanatracker.io/price/history/range",
+            headers={"x-api-key": SOLANA_TRACKER_API_KEY},
+            params={
+                "token": ca_norm,
+                "time_from": time_from,
+                "time_to": time_to,
+            },
+            timeout=HISTORICAL_ATH_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.ok:
+            payload = response.json() or {}
+            highest = ((payload.get("price") or {}).get("highest") or {})
+            marketcap = float(highest.get("marketcap", 0) or 0.0)
+            ath_time = int(highest.get("time", 0) or 0)
+            if marketcap > 0 and ath_time > 0:
+                value = {
+                    "marketcap": marketcap,
+                    "time": ath_time,
+                    "source": "solanatracker_range",
+                }
+        elif response.status_code not in {404, 422}:
+            print(f"Historical ATH fetch error ({response.status_code}) for {ca_norm}")
+    except Exception as exc:
+        print(f"Historical ATH fetch exception for {ca_norm}: {exc}")
+
+    _historical_ath_cache[cache_key] = {
+        "value": value,
+        "expires_at": now_ts + HISTORICAL_ATH_CACHE_TTL_SECONDS,
+    }
+    if len(_historical_ath_cache) > 4000:
+        stale_keys = [key for key, row in _historical_ath_cache.items() if row.get("expires_at", 0) <= now_ts]
+        for key in stale_keys:
+            _historical_ath_cache.pop(key, None)
+        while len(_historical_ath_cache) > 4000:
+            _historical_ath_cache.pop(next(iter(_historical_ath_cache)), None)
+
+    return value
+
+
+def should_reconcile_historical_ath(call_doc, force=False, now=None):
+    if not HISTORICAL_ATH_ENABLED:
+        return False
+    if not call_doc:
+        return False
+    if not (call_doc.get("ca_norm") or call_doc.get("ca")):
+        return False
+
+    ts = _to_utc_datetime(call_doc.get("timestamp"))
+    if ts is None:
+        return False
+    now = _to_utc_datetime(now) or utc_now()
+    age_seconds = max(0.0, (now - ts).total_seconds())
+    if age_seconds < HISTORICAL_ATH_MIN_CALL_AGE_SECONDS:
+        return False
+    if force:
+        return True
+
+    last_checked = _to_utc_datetime(call_doc.get("last_hist_ath_checked_at"))
+    if last_checked is None:
+        return True
+    return (now - last_checked).total_seconds() >= (HISTORICAL_ATH_RECHECK_MINUTES * 60)
+
+
+def reconcile_calls_with_historical_ath(call_entries, limit=0, force=False):
+    stats = {"checked": 0, "updated": 0}
+    if not HISTORICAL_ATH_ENABLED or not call_entries or limit == 0:
+        return stats
+
+    now = utc_now()
+    deduped = []
+    seen_keys = set()
+    for entry in call_entries:
+        if not isinstance(entry, dict):
+            continue
+        call_doc = entry.get("call")
+        collection_name = entry.get("collection")
+        if collection_name not in {"live", "archive"} or not call_doc or call_doc.get("_id") is None:
+            continue
+        dedupe_key = (collection_name, call_doc.get("_id"))
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        deduped.append(entry)
+
+    if limit > 0:
+        deduped = deduped[:int(limit)]
+
+    for entry in deduped:
+        call_doc = entry["call"]
+        if not should_reconcile_historical_ath(call_doc, force=force, now=now):
+            continue
+
+        ts = _to_utc_datetime(call_doc.get("timestamp"))
+        time_from = int(ts.timestamp()) if ts is not None else 0
+        time_to = int(now.timestamp())
+        if time_from <= 0 or time_to <= time_from:
+            continue
+
+        stats["checked"] += 1
+        hist = get_solanatracker_ath_range(
+            call_doc.get("ca_norm", normalize_ca(call_doc.get("ca", ""))),
+            time_from=time_from,
+            time_to=time_to,
+        )
+
+        collection = calls_collection if entry["collection"] == "live" else calls_archive_collection
+        set_fields = {
+            "last_hist_ath_checked_at": now,
+            "last_hist_ath_provider": HISTORICAL_ATH_PROVIDER,
+        }
+
+        initial_val = float(call_doc.get("initial_mcap", 0) or 0)
+        old_ath_val = float(call_doc.get("ath_mcap", 0) or 0)
+        old_current_val = float(call_doc.get("current_mcap", initial_val) or initial_val)
+        old_x_peak = (max(old_ath_val, old_current_val) / initial_val) if initial_val > 0 else 0.0
+        new_ath_val = old_ath_val
+
+        if hist:
+            hist_ath = float(hist.get("marketcap", 0) or 0)
+            if hist_ath > new_ath_val:
+                new_ath_val = hist_ath
+                ath_seen_at = datetime.fromtimestamp(int(hist.get("time")), tz=timezone.utc)
+                set_fields.update(
+                    {
+                        "ath_mcap": hist_ath,
+                        "ath_seen_at": ath_seen_at,
+                        "ath_source": hist.get("source", "solanatracker_range"),
+                    }
+                )
+
+        result = collection.update_one({"_id": call_doc["_id"]}, {"$set": set_fields})
+        call_doc["last_hist_ath_checked_at"] = now
+        call_doc["last_hist_ath_provider"] = HISTORICAL_ATH_PROVIDER
+        if new_ath_val > old_ath_val + 1e-12:
+            new_x_peak = (max(new_ath_val, old_current_val) / initial_val) if initial_val > 0 else 0.0
+            upsert_rollup_for_call_peak_delta(call_doc, old_x_peak, new_x_peak)
+            call_doc["ath_mcap"] = new_ath_val
+            if "ath_seen_at" in set_fields:
+                call_doc["ath_seen_at"] = set_fields["ath_seen_at"]
+                call_doc["ath_source"] = set_fields["ath_source"]
+            stats["updated"] += 1
+
+    return stats
+
+
+def build_historical_reconcile_entries(call_docs, collection_name, protected_ids=None, sort_by_recent=True):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
+    entries = []
+    for call in call_docs or []:
+        ts = _to_utc_datetime(call.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc)
+        checked_at = _to_utc_datetime(call.get("last_hist_ath_checked_at")) or datetime.min.replace(tzinfo=timezone.utc)
+        entries.append(
+            {
+                "call": call,
+                "collection": collection_name,
+                "_sort": (
+                    0 if call.get("_id") in protected_ids else 1,
+                    0 if call.get("last_hist_ath_checked_at") is None else 1,
+                    -int(ts.timestamp()) if sort_by_recent else int(checked_at.timestamp()),
+                    -call_peak_x(call),
+                ),
+            }
+        )
+    entries.sort(key=lambda row: row.get("_sort"))
+    for entry in entries:
+        entry.pop("_sort", None)
+    return entries
+
+
 def update_user_profile(chat_id, user, event_type, reason=None):
     update_doc = {
         "$setOnInsert": {
@@ -778,17 +1136,13 @@ def derive_user_metrics(calls):
     avg_ath = sum(returns_ath) / n
     win_rate = wins / n
     profitable_rate = profitable_peak / n
-    profitability = clamp((avg_ath + 1.0) / 2.0, 0.0, 1.0)
-    upside_norm = clamp((avg_ath + 1.0) / 3.0, 0.0, 1.0)
-    sample_conf = clamp(math.log1p(n) / math.log(25), 0.0, 1.0)
-
-    reputation = 100.0 * (
-        0.40 * win_rate
-        + 0.30 * profitability
-        + 0.20 * upside_norm
-        + 0.10 * sample_conf
+    reputation = compute_performance_score(
+        calls=n,
+        avg_x=1.0 + avg_ath,
+        win_rate=win_rate,
+        profitable_rate=profitable_rate,
+        best_x=best_x,
     )
-    reputation = clamp(reputation, 0.0, 100.0)
 
     badges = []
     if best_x >= 100.0:
@@ -1036,18 +1390,19 @@ def call_peak_x(call_doc):
 
 
 def _refresh_rollup_rates(chat_id, caller_key):
+    avg_x_expr = {
+        "$cond": [
+            {"$gt": ["$calls", 0]},
+            {"$divide": ["$sum_x_peak", "$calls"]},
+            0,
+        ]
+    }
     caller_rollups_collection.update_one(
         {"chat_id": chat_id, "caller_key": caller_key},
         [
             {
                 "$set": {
-                    "avg_x": {
-                        "$cond": [
-                            {"$gt": ["$calls", 0]},
-                            {"$divide": ["$sum_x_peak", "$calls"]},
-                            0,
-                        ]
-                    },
+                    "avg_x": avg_x_expr,
                     "win_rate": {
                         "$multiply": [
                             100,
@@ -1072,6 +1427,13 @@ def _refresh_rollup_rates(chat_id, caller_key):
                             },
                         ]
                     },
+                    "score": mongo_performance_score_expr(
+                        calls_expr="$calls",
+                        wins_expr="$wins",
+                        profitables_expr="$profitables",
+                        avg_x_expr=avg_x_expr,
+                        best_x_expr="$best_x",
+                    ),
                 }
             }
         ],
@@ -1104,6 +1466,7 @@ def apply_rollup_delta(
             "avg_x": 0.0,
             "win_rate": 0.0,
             "profitable_rate": 0.0,
+            "score": 0.0,
         },
         "$max": {"best_x": float(best_x_candidate or 0.0)},
     }
@@ -1237,8 +1600,15 @@ def recompute_rollups_for_chat(chat_id):
         profitables = int(row.get("profitables", 0) or 0)
         sum_x_peak = float(row.get("sum_x_peak", 0) or 0.0)
         avg_x = (sum_x_peak / calls) if calls > 0 else 0.0
-        win_rate = (wins / calls * 100.0) if calls > 0 else 0.0
-        profitable_rate = (profitables / calls * 100.0) if calls > 0 else 0.0
+        win_rate_ratio = (wins / calls) if calls > 0 else 0.0
+        profitable_rate_ratio = (profitables / calls) if calls > 0 else 0.0
+        score = compute_performance_score(
+            calls=calls,
+            avg_x=avg_x,
+            win_rate=win_rate_ratio,
+            profitable_rate=profitable_rate_ratio,
+            best_x=float(row.get("best_x", 0) or 0.0),
+        )
         docs.append(
             {
                 "chat_id": chat_id,
@@ -1251,8 +1621,9 @@ def recompute_rollups_for_chat(chat_id):
                 "sum_x_peak": sum_x_peak,
                 "best_x": float(row.get("best_x", 0) or 0.0),
                 "avg_x": float(avg_x),
-                "win_rate": float(win_rate),
-                "profitable_rate": float(profitable_rate),
+                "win_rate": float(win_rate_ratio * 100.0),
+                "profitable_rate": float(profitable_rate_ratio * 100.0),
+                "score": float(score),
                 "updated_at": now,
             }
         )
@@ -1329,6 +1700,335 @@ def _hours_since(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return (utc_now() - dt).total_seconds() / 3600.0
+
+
+def refresh_cache_key(chat_id, time_filter, is_bottom, page, items_per_page):
+    time_filter = time_filter or {}
+    timestamp_filter = time_filter.get("timestamp") or {}
+    ts_from = timestamp_filter.get("$gte")
+    ts_key = ts_from.astimezone(timezone.utc).isoformat() if isinstance(ts_from, datetime) else ""
+    return (
+        int(chat_id),
+        bool(is_bottom),
+        ts_key,
+        int(page or 0),
+        int(items_per_page or 0),
+    )
+
+
+def get_leaderboard_page_cache(chat_id, time_filter, is_bottom, page, items_per_page):
+    key = refresh_cache_key(chat_id, time_filter, is_bottom, page, items_per_page)
+    now_ts = time.time()
+    row = _leaderboard_page_cache.get(key)
+    if not row:
+        return None
+    if row.get("expires_at", 0) <= now_ts:
+        _leaderboard_page_cache.pop(key, None)
+        return None
+    return row.get("value")
+
+
+def set_leaderboard_page_cache(chat_id, time_filter, is_bottom, page, items_per_page, value):
+    key = refresh_cache_key(chat_id, time_filter, is_bottom, page, items_per_page)
+    now_ts = time.time()
+    _leaderboard_page_cache[key] = {
+        "value": value,
+        "expires_at": now_ts + LEADERBOARD_CACHE_TTL_SECONDS,
+    }
+    if len(_leaderboard_page_cache) > 800:
+        stale = [k for k, row in _leaderboard_page_cache.items() if row.get("expires_at", 0) <= now_ts]
+        for k in stale:
+            _leaderboard_page_cache.pop(k, None)
+        while len(_leaderboard_page_cache) > 800:
+            _leaderboard_page_cache.pop(next(iter(_leaderboard_page_cache)), None)
+
+
+def invalidate_leaderboard_cache(chat_id):
+    target = int(chat_id)
+    keys = [k for k in _leaderboard_page_cache.keys() if int(k[0]) == target]
+    for k in keys:
+        _leaderboard_page_cache.pop(k, None)
+
+
+def call_current_x(call_doc):
+    initial = float(call_doc.get("initial_mcap", 0) or 0)
+    if initial <= 0:
+        return 0.0
+    current = float(call_doc.get("current_mcap", initial) or initial)
+    return current / initial
+
+
+def compute_call_refresh_state(call_doc, now=None):
+    now = _to_utc_datetime(now) or utc_now()
+    ts = _to_utc_datetime(call_doc.get("timestamp")) or now
+    age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
+    x_peak = call_peak_x(call_doc)
+    current_x = call_current_x(call_doc)
+    volume_h1 = float(call_doc.get("volume_h1", call_doc.get("volume_h24", 0)) or 0.0)
+    repost_count = int(call_doc.get("repost_count", 0) or 0)
+    repost_hours = _hours_since(_to_utc_datetime(call_doc.get("last_reposted_at")))
+    ath_change_hours = _hours_since(_to_utc_datetime(call_doc.get("last_ath_change_at")) or _to_utc_datetime(call_doc.get("ath_seen_at")))
+
+    priority = 0.0
+    priority += min(420.0, max(0.0, x_peak - 1.0) * 140.0)
+    priority += min(140.0, volume_h1 / 120.0)
+
+    if age_hours <= 1:
+        priority += 180.0
+    elif age_hours <= 6:
+        priority += 120.0
+    elif age_hours <= 24:
+        priority += 70.0
+    elif age_hours <= 72:
+        priority += 35.0
+    else:
+        priority += 10.0
+
+    if current_x >= 2.0:
+        priority += 110.0
+    elif current_x >= 1.2:
+        priority += 50.0
+
+    if ath_change_hours is not None:
+        if ath_change_hours <= 1:
+            priority += 220.0
+        elif ath_change_hours <= 6:
+            priority += 140.0
+        elif ath_change_hours <= 24:
+            priority += 70.0
+
+    if repost_hours is not None:
+        if repost_hours <= 1:
+            priority += 140.0
+        elif repost_hours <= 6:
+            priority += 80.0
+        elif repost_hours <= RUNNER_REPOST_BOOST_HOURS:
+            priority += 35.0
+
+    if repost_count > 0:
+        priority += min(90.0, repost_count * 12.0)
+
+    if volume_h1 < LOW_VOLUME_STASH_THRESHOLD:
+        priority -= 65.0
+    if age_hours >= 12 and current_x <= 0.5 and x_peak < 1.2:
+        priority -= 140.0
+    if age_hours >= 96 and x_peak < RUNNER_PROTECT_MIN_X:
+        priority -= 50.0
+    if bool(call_doc.get("is_stashed", False)):
+        priority -= 120.0
+
+    priority = int(max(0.0, priority))
+
+    if ath_change_hours is not None and ath_change_hours <= 1:
+        interval_seconds = HOT_REFRESH_INTERVAL_SECONDS
+    elif repost_hours is not None and repost_hours <= 1:
+        interval_seconds = HOT_REFRESH_INTERVAL_SECONDS
+    elif x_peak >= 5.0 or (x_peak >= 2.0 and age_hours <= 24):
+        interval_seconds = HOT_REFRESH_INTERVAL_SECONDS
+    elif x_peak >= 2.0 or current_x >= 1.5 or age_hours <= 6:
+        interval_seconds = WARM_REFRESH_INTERVAL_SECONDS
+    elif x_peak >= 1.2 or age_hours <= 24 or volume_h1 >= LOW_VOLUME_STASH_THRESHOLD:
+        interval_seconds = NORMAL_REFRESH_INTERVAL_SECONDS
+    elif age_hours >= 12 and current_x <= 0.5 and x_peak < 1.2:
+        interval_seconds = max(COLD_REFRESH_INTERVAL_SECONDS, 3600)
+    else:
+        interval_seconds = COLD_REFRESH_INTERVAL_SECONDS
+
+    should_protect = False
+    if x_peak >= RUNNER_PROTECT_MIN_X and age_hours <= RUNNER_PROTECT_MAX_AGE_HOURS:
+        should_protect = True
+    if current_x >= RUNNER_PROTECT_MIN_X and age_hours <= max(24, RUNNER_PROTECT_MAX_AGE_HOURS // 2):
+        should_protect = True
+    if ath_change_hours is not None and ath_change_hours <= 24 and x_peak >= 1.2:
+        should_protect = True
+    if repost_hours is not None and repost_hours <= RUNNER_REPOST_BOOST_HOURS and age_hours <= RUNNER_PROTECT_MAX_AGE_HOURS:
+        should_protect = True
+
+    return {
+        "priority": priority,
+        "interval_seconds": int(interval_seconds),
+        "next_refresh_at": now + timedelta(seconds=int(interval_seconds)),
+        "should_protect": bool(should_protect),
+    }
+
+
+def refresh_state_update_fields(call_doc, now=None):
+    now = _to_utc_datetime(now) or utc_now()
+    state = compute_call_refresh_state(call_doc, now=now)
+    return {
+        "refresh_priority": int(state["priority"]),
+        "refresh_interval_seconds": int(state["interval_seconds"]),
+        "next_refresh_at": state["next_refresh_at"],
+    }
+
+
+def should_stash_low_volume_call(call_doc, volume_h1, now=None, protected_ids=None, state=None):
+    if float(volume_h1 or 0.0) >= LOW_VOLUME_STASH_THRESHOLD:
+        return False
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
+    if call_doc.get("_id") in protected_ids:
+        return False
+    now = _to_utc_datetime(now) or utc_now()
+    ts = _to_utc_datetime(call_doc.get("timestamp")) or now
+    age_hours = max(0.0, (now - ts).total_seconds() / 3600.0)
+    if age_hours < LOW_VOLUME_STASH_MIN_AGE_HOURS:
+        return False
+    state = state or compute_call_refresh_state(call_doc, now=now)
+    if state.get("should_protect"):
+        return False
+    return True
+
+
+def seed_refresh_queue_metadata(chat_id, limit=250):
+    candidates = list(
+        calls_collection.find(
+            _accepted_query(
+                chat_id,
+                {
+                    "$or": [
+                        {"next_refresh_at": {"$exists": False}},
+                        {"refresh_priority": {"$exists": False}},
+                    ]
+                },
+            )
+        )
+        .sort("timestamp", -1)
+        .limit(max(1, int(limit)))
+    )
+    if not candidates:
+        return 0
+    now = utc_now()
+    updated = 0
+    for call in candidates:
+        fields = refresh_state_update_fields(call, now=now)
+        result = calls_collection.update_one({"_id": call["_id"]}, {"$set": fields})
+        updated += int(result.modified_count or 0)
+    return updated
+
+
+def select_runner_protected_ids(chat_id, lookback_days=REFRESH_QUEUE_LOOKBACK_DAYS, limit=RUNNER_PROTECT_MAX_CALLS):
+    cutoff = utc_now() - timedelta(days=max(1, int(lookback_days or REFRESH_QUEUE_LOOKBACK_DAYS)))
+    candidates = list(
+        calls_collection.find(
+            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})
+        )
+        .sort("timestamp", -1)
+        .limit(max(limit * 5, limit))
+    )
+    scored = []
+    now = utc_now()
+    for call in candidates:
+        state = compute_call_refresh_state(call, now=now)
+        if state["should_protect"]:
+            scored.append((int(state["priority"]), call.get("_id")))
+    scored.sort(key=lambda row: row[0], reverse=True)
+    return {obj_id for _, obj_id in scored[:max(1, int(limit))] if obj_id is not None}
+
+
+def stash_low_priority_calls(chat_id, active_limit=ACTIVE_LIVE_CALLS_PER_CHAT, protected_ids=None):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
+    active_query = _accepted_query(chat_id, {"is_stashed": {"$ne": True}})
+    active_count = calls_collection.count_documents(active_query)
+    overflow = max(0, int(active_count) - int(active_limit))
+    if overflow <= 0:
+        return 0
+
+    cutoff = utc_now() - timedelta(hours=GLOBAL_STASH_MIN_AGE_HOURS)
+    candidates = list(
+        calls_collection.find(
+            _accepted_query(
+                chat_id,
+                {
+                    "is_stashed": {"$ne": True},
+                    "timestamp": {"$lt": cutoff},
+                    **({"_id": {"$nin": list(protected_ids)}} if protected_ids else {}),
+                },
+            )
+        )
+        .sort([("refresh_priority", ASCENDING), ("next_refresh_at", ASCENDING), ("timestamp", ASCENDING)])
+        .limit(max(overflow * 3, overflow))
+    )
+    if not candidates:
+        return 0
+
+    to_stash_ids = [call["_id"] for call in candidates[:overflow] if call.get("_id") is not None]
+    if not to_stash_ids:
+        return 0
+
+    result = calls_collection.update_many(
+        {"_id": {"$in": to_stash_ids}},
+        {
+            "$set": {
+                "is_stashed": True,
+                "stashed_reason": "priority_queue",
+                "stashed_at": utc_now(),
+            }
+        },
+    )
+    return int(result.modified_count or 0)
+
+
+def load_due_refresh_calls(chat_id, protected_ids=None, limit=REFRESH_QUEUE_MAX_CALLS_PER_CHAT, lookback_days=REFRESH_QUEUE_LOOKBACK_DAYS):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
+    now = utc_now()
+    cutoff = now - timedelta(days=max(1, int(lookback_days or REFRESH_QUEUE_LOOKBACK_DAYS)))
+    due_or = [
+        {"next_refresh_at": {"$lte": now}},
+        {"next_refresh_at": {"$exists": False}},
+    ]
+    if protected_ids:
+        due_or.append({"_id": {"$in": list(protected_ids)}})
+    query = _accepted_query(
+        chat_id,
+        {
+            "timestamp": {"$gte": cutoff},
+            "is_stashed": {"$ne": True},
+            "$or": due_or,
+        },
+    )
+    calls = list(
+        calls_collection.find(query)
+        .sort([("refresh_priority", DESCENDING), ("next_refresh_at", ASCENDING), ("timestamp", DESCENDING)])
+        .limit(max(1, int(limit)))
+    )
+    if calls:
+        return calls
+
+    fallback_query = _accepted_query(
+        chat_id,
+        {
+            "timestamp": {"$gte": cutoff},
+            "is_stashed": {"$ne": True},
+        },
+    )
+    return list(
+        calls_collection.find(fallback_query)
+        .sort([("refresh_priority", DESCENDING), ("timestamp", DESCENDING)])
+        .limit(max(1, int(limit)))
+    )
+
+
+def maybe_run_daily_rollup_repair(chat_id, now=None):
+    now = _to_utc_datetime(now) or utc_now()
+    if now.hour < DAILY_ROLLUP_REPAIR_HOUR_UTC:
+        return False
+    today = now.strftime("%Y-%m-%d")
+    setting = settings_collection.find_one({"chat_id": chat_id}, {"last_rollup_rebuild_date": 1}) or {}
+    if setting.get("last_rollup_rebuild_date") == today:
+        return False
+    recompute_rollups_for_chat(chat_id)
+    settings_collection.update_one(
+        {"chat_id": chat_id},
+        {
+            "$set": {
+                "rollup_version": ROLLUP_SCHEMA_VERSION,
+                "last_rollup_rebuild_date": today,
+            }
+        },
+        upsert=True,
+    )
+    invalidate_leaderboard_cache(chat_id)
+    return True
 
 
 GLOBAL_ADMIN_USERNAMES = {"deanncrypto"}
@@ -1576,6 +2276,7 @@ def invalidate_groupstats_cache(chat_id):
     media_keys = [k for k in _groupstats_media_cache.keys() if int(k[0]) == target]
     for k in media_keys:
         _groupstats_media_cache.pop(k, None)
+    invalidate_leaderboard_cache(chat_id)
 
 
 def compute_group_stats_snapshot(chat_id, time_filter):
@@ -1722,7 +2423,60 @@ def _mongo_caller_key_expr():
     }
 
 
-def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER):
+def select_priority_ath_call_ids(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_PRIORITY_KEEP_MAX_CALLS):
+    if limit <= 0:
+        return set()
+
+    cutoff = utc_now() - timedelta(days=max(1, int(lookback_days or ATH_TRACK_WINDOW_DAYS)))
+    pipeline = [
+        {"$match": _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}})},
+        {
+            "$project": {
+                "_id": 1,
+                "initial_mcap": 1,
+                "ath_mcap": 1,
+                "current_mcap": 1,
+                "timestamp": 1,
+            }
+        },
+        {
+            "$addFields": {
+                "_initial": {"$toDouble": {"$ifNull": ["$initial_mcap", 0]}},
+                "_ath": {"$toDouble": {"$ifNull": ["$ath_mcap", 0]}},
+                "_current": {"$toDouble": {"$ifNull": ["$current_mcap", 0]}},
+            }
+        },
+        {"$match": {"_initial": {"$gt": 0}}},
+        {"$addFields": {"_peak": {"$cond": [{"$gt": ["$_ath", "$_current"]}, "$_ath", "$_current"]}}},
+        {"$addFields": {"_x_peak": {"$divide": ["$_peak", "$_initial"]}}},
+        {"$match": {"_x_peak": {"$gte": ATH_PRIORITY_MIN_X}}},
+        {"$sort": {"_x_peak": -1, "timestamp": -1}},
+        {"$limit": int(limit)},
+        {"$project": {"_id": 1}},
+    ]
+    rows = list(calls_collection.aggregate(pipeline, allowDiskUse=True))
+    return {row.get("_id") for row in rows if row.get("_id") is not None}
+
+
+def reactivate_priority_calls(protected_ids):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
+    if not protected_ids:
+        return 0
+    result = calls_collection.update_many(
+        {"_id": {"$in": list(protected_ids)}, "is_stashed": True},
+        {
+            "$set": {
+                "is_stashed": False,
+                "last_reactivated_at": utc_now(),
+            },
+            "$unset": {"stashed_reason": "", "stashed_at": ""},
+        },
+    )
+    return int(result.modified_count or 0)
+
+
+def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER, protected_ids=None):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
     active_calls = list(
         calls_collection.find(
             _accepted_query(chat_id, {"is_stashed": {"$ne": True}})
@@ -1735,6 +2489,8 @@ def stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER):
     seen_per_caller = {}
     to_stash_ids = []
     for call in active_calls:
+        if call.get("_id") in protected_ids:
+            continue
         key = get_caller_key(call)
         seen = seen_per_caller.get(key, 0)
         if seen < keep_latest:
@@ -1771,14 +2527,24 @@ def _to_archive_doc(call_doc):
         "ath_mcap": float(call_doc.get("ath_mcap", 0) or 0),
         "current_mcap": float(call_doc.get("current_mcap", 0) or 0),
         "stashed_reason": call_doc.get("stashed_reason", "older_call"),
+        "ath_seen_at": call_doc.get("ath_seen_at"),
+        "ath_source": call_doc.get("ath_source"),
+        "repost_count": int(call_doc.get("repost_count", 0) or 0),
+        "last_reposted_at": call_doc.get("last_reposted_at"),
+        "last_ath_change_at": call_doc.get("last_ath_change_at"),
+        "last_hist_ath_checked_at": call_doc.get("last_hist_ath_checked_at"),
+        "last_hist_ath_provider": call_doc.get("last_hist_ath_provider"),
         "archived_at": utc_now(),
     }
 
 
-def archive_stashed_calls(chat_id, reason="older_call", limit=1000, older_than=None):
+def archive_stashed_calls(chat_id, reason="older_call", limit=1000, older_than=None, protected_ids=None):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
     query = _accepted_query(chat_id, {"is_stashed": True, "stashed_reason": reason})
     if older_than is not None:
         query = {**query, "timestamp": {"$lt": older_than}}
+    if protected_ids:
+        query = {**query, "_id": {"$nin": list(protected_ids)}}
     candidates = list(
         calls_collection.find(
             query,
@@ -1801,10 +2567,11 @@ def archive_stashed_calls(chat_id, reason="older_call", limit=1000, older_than=N
     return int(result.deleted_count or 0)
 
 
-def archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000):
+def archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000, protected_ids=None):
     if inactive_hours <= 0:
         return 0
 
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
     cutoff = utc_now() - timedelta(hours=int(inactive_hours))
     caller_key_expr = _mongo_caller_key_expr()
     inactive_pipeline = [
@@ -1825,6 +2592,7 @@ def archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOU
             {
                 **_accepted_query(chat_id),
                 "$expr": {"$in": [caller_key_expr, inactive_keys]},
+                **({"_id": {"$nin": list(protected_ids)}} if protected_ids else {}),
             },
             {"message_id": 0, "message_date": 0, "caller_username": 0, "ca": 0},
         )
@@ -1858,50 +2626,230 @@ def load_calls_for_stats(chat_id, extra=None, include_archive=True):
     return live_calls, archived_calls, (live_calls + archived_calls)
 
 
+def refresh_archived_calls_market_data(calls):
+    if not calls:
+        return 0
+
+    unique_cas = list(
+        {
+            call.get("ca_norm", normalize_ca(call.get("ca", "")))
+            for call in calls
+            if call.get("ca_norm") or call.get("ca")
+        }
+    )
+    if not unique_cas:
+        return 0
+
+    latest_meta = get_dexscreener_batch_meta(unique_cas)
+    updated = 0
+    now = utc_now()
+
+    for call in calls:
+        ca_norm = call.get("ca_norm", normalize_ca(call.get("ca", "")))
+        meta = latest_meta.get(ca_norm, {})
+        current_mcap = meta.get("fdv", call.get("current_mcap", call.get("initial_mcap", 0)))
+        if not current_mcap:
+            continue
+
+        initial_val = float(call.get("initial_mcap", 0) or 0)
+        old_ath_val = float(call.get("ath_mcap", current_mcap) or current_mcap)
+        old_current_val = float(call.get("current_mcap", current_mcap) or current_mcap)
+        old_x_peak = (max(old_ath_val, old_current_val) / initial_val) if initial_val > 0 else 0.0
+        ath = max(float(call.get("ath_mcap", current_mcap) or current_mcap), float(current_mcap))
+        new_x_peak = (float(ath) / initial_val) if initial_val > 0 else 0.0
+
+        update_fields = {
+            "current_mcap": current_mcap,
+            "ath_mcap": ath,
+            "last_market_refresh_at": now,
+        }
+        if ath > old_ath_val + 1e-12:
+            update_fields["ath_seen_at"] = now
+            update_fields["last_ath_change_at"] = now
+            update_fields["ath_source"] = "dex_live"
+        if meta.get("symbol"):
+            update_fields["token_symbol"] = meta["symbol"]
+
+        result = calls_archive_collection.update_one({"_id": call["_id"]}, {"$set": update_fields})
+        updated += int(result.modified_count or 0)
+        upsert_rollup_for_call_peak_delta(call, old_x_peak, new_x_peak)
+        call["current_mcap"] = current_mcap
+        call["ath_mcap"] = ath
+        if ath > old_ath_val + 1e-12:
+            call["ath_seen_at"] = now
+            call["last_ath_change_at"] = now
+            call["ath_source"] = "dex_live"
+        if meta.get("symbol"):
+            call["token_symbol"] = meta["symbol"]
+
+    return updated
+
+
 def refresh_recent_call_peaks(chat_id, lookback_days=ATH_TRACK_WINDOW_DAYS, limit=ATH_TRACK_MAX_CALLS_PER_CHAT):
-    archived_inactive = archive_inactive_callers(chat_id, inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS, limit=5000)
-    stashed_count = stash_old_calls_per_caller(chat_id, keep_latest=HEARTBEAT_CALLS_PER_CALLER)
-    archived_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000)
+    seeded_metadata = seed_refresh_queue_metadata(chat_id)
+    protected_ids = select_runner_protected_ids(
+        chat_id,
+        lookback_days=max(lookback_days, REFRESH_QUEUE_LOOKBACK_DAYS),
+        limit=RUNNER_PROTECT_MAX_CALLS,
+    )
+    protected_ids.update(
+        select_priority_ath_call_ids(chat_id, lookback_days=lookback_days, limit=ATH_PRIORITY_KEEP_MAX_CALLS)
+    )
+    reactivated_count = reactivate_priority_calls(protected_ids)
+    archived_inactive = archive_inactive_callers(
+        chat_id,
+        inactive_hours=INACTIVE_CALLER_ARCHIVE_HOURS,
+        limit=5000,
+        protected_ids=protected_ids,
+    )
+    stashed_count = stash_low_priority_calls(
+        chat_id,
+        active_limit=ACTIVE_LIVE_CALLS_PER_CHAT,
+        protected_ids=protected_ids,
+    )
+    priority_stash_cutoff = utc_now() - timedelta(hours=PRIORITY_STASH_ARCHIVE_MIN_AGE_HOURS)
+    archived_old = archive_stashed_calls(
+        chat_id,
+        reason="priority_queue",
+        limit=1000,
+        older_than=priority_stash_cutoff,
+        protected_ids=protected_ids,
+    )
+    migrated_old = archive_stashed_calls(chat_id, reason="older_call", limit=1000, protected_ids=protected_ids)
     low_volume_cutoff = utc_now() - timedelta(hours=LOW_VOLUME_ARCHIVE_MIN_AGE_HOURS)
     archived_low_pre = archive_stashed_calls(
         chat_id,
         reason="low_volume",
         limit=1000,
         older_than=low_volume_cutoff,
+        protected_ids=protected_ids,
     )
-    cutoff = utc_now() - timedelta(days=lookback_days)
-    calls = list(
-        calls_collection.find(
-            _accepted_query(chat_id, {"timestamp": {"$gte": cutoff}, "is_stashed": {"$ne": True}})
-        )
-        .sort("timestamp", -1)
-        .limit(limit)
+    refresh_limit = max(1, min(int(limit or REFRESH_QUEUE_MAX_CALLS_PER_CHAT), REFRESH_QUEUE_MAX_CALLS_PER_CHAT))
+    calls = load_due_refresh_calls(
+        chat_id,
+        protected_ids=protected_ids,
+        limit=refresh_limit,
+        lookback_days=max(lookback_days, REFRESH_QUEUE_LOOKBACK_DAYS),
     )
     if not calls:
-        if archived_inactive > 0 or stashed_count > 0 or archived_old > 0 or archived_low_pre > 0:
+        if (
+            seeded_metadata > 0
+            or reactivated_count > 0
+            or archived_inactive > 0
+            or stashed_count > 0
+            or archived_old > 0
+            or migrated_old > 0
+            or archived_low_pre > 0
+        ):
             invalidate_groupstats_cache(chat_id)
         return 0
-    refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=True)
+    refreshed_count = refresh_calls_market_data(
+        calls,
+        include_stashed=False,
+        apply_stash_policy=True,
+        protected_ids=protected_ids,
+    )
+    live_hist_stats = {"checked": 0, "updated": 0}
+    archive_hist_stats = {"checked": 0, "updated": 0}
+    if HISTORICAL_ATH_ENABLED:
+        live_entries = build_historical_reconcile_entries(
+            calls,
+            collection_name="live",
+            protected_ids=protected_ids,
+        )
+        live_hist_stats = reconcile_calls_with_historical_ath(
+            live_entries,
+            limit=HISTORICAL_ATH_HEARTBEAT_MAX_CALLS,
+            force=False,
+        )
+        if HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS > 0:
+            archived_cutoff = utc_now() - timedelta(days=HISTORICAL_ATH_ARCHIVE_LOOKBACK_DAYS)
+            archived_candidates = list(
+                calls_archive_collection.find(
+                    _accepted_query(chat_id, {"timestamp": {"$gte": archived_cutoff}})
+                )
+                .sort("timestamp", -1)
+                .limit(max(HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS * 4, HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS))
+            )
+            archive_entries = build_historical_reconcile_entries(
+                archived_candidates,
+                collection_name="archive",
+            )
+            archive_hist_stats = reconcile_calls_with_historical_ath(
+                archive_entries,
+                limit=HISTORICAL_ATH_ARCHIVE_HEARTBEAT_MAX_CALLS,
+                force=False,
+            )
     archived_low_post = archive_stashed_calls(
         chat_id,
         reason="low_volume",
         limit=1000,
         older_than=low_volume_cutoff,
+        protected_ids=protected_ids,
     )
-    if archived_low_post > 0:
+    if (
+        seeded_metadata > 0
+        or reactivated_count > 0
+        or archived_inactive > 0
+        or stashed_count > 0
+        or archived_old > 0
+        or migrated_old > 0
+        or archived_low_pre > 0
+        or archived_low_post > 0
+        or refreshed_count > 0
+        or live_hist_stats["updated"] > 0
+        or archive_hist_stats["updated"] > 0
+    ):
         invalidate_groupstats_cache(chat_id)
-    invalidate_groupstats_cache(chat_id)
     return len(calls)
 
 
 def refresh_all_call_peaks(chat_id):
-    calls = list(calls_collection.find(_accepted_query(chat_id)))
-    if not calls:
+    live_calls = list(calls_collection.find(_accepted_query(chat_id)))
+    archived_cutoff = utc_now() - timedelta(days=max(ATH_TRACK_WINDOW_DAYS, 30))
+    archived_calls = list(
+        calls_archive_collection.find(_accepted_query(chat_id, {"timestamp": {"$gte": archived_cutoff}}))
+        .sort("timestamp", -1)
+        .limit(ATH_TRACK_MAX_CALLS_PER_CHAT)
+    )
+    if not live_calls and not archived_calls:
         return {"calls": 0, "tokens": 0, "updated": 0}
-    tokens = len({call.get("ca_norm", normalize_ca(call.get("ca", ""))) for call in calls if call.get("ca")})
-    updated = refresh_calls_market_data(calls, include_stashed=True, apply_stash_policy=True)
+
+    tokens = len(
+        {
+            call.get("ca_norm", normalize_ca(call.get("ca", "")))
+            for call in (live_calls + archived_calls)
+            if call.get("ca_norm") or call.get("ca")
+        }
+    )
+    updated_live = refresh_calls_market_data(live_calls, include_stashed=True, apply_stash_policy=True) if live_calls else 0
+    updated_archived = refresh_archived_calls_market_data(archived_calls) if archived_calls else 0
+    historical_stats = {"checked": 0, "updated": 0}
+    if HISTORICAL_ATH_ENABLED and HISTORICAL_ATH_MANUAL_MAX_CALLS > 0:
+        historical_entries = build_historical_reconcile_entries(
+            live_calls,
+            collection_name="live",
+            protected_ids={call.get("_id") for call in live_calls if call_peak_x(call) >= ATH_PRIORITY_MIN_X},
+        )
+        historical_entries += build_historical_reconcile_entries(
+            archived_calls,
+            collection_name="archive",
+        )
+        historical_stats = reconcile_calls_with_historical_ath(
+            historical_entries,
+            limit=HISTORICAL_ATH_MANUAL_MAX_CALLS,
+            force=True,
+        )
     invalidate_groupstats_cache(chat_id)
-    return {"calls": len(calls), "tokens": tokens, "updated": updated}
+    return {
+        "calls": len(live_calls) + len(archived_calls),
+        "tokens": tokens,
+        "updated": updated_live + updated_archived + historical_stats["updated"],
+        "live_calls": len(live_calls),
+        "archived_calls": len(archived_calls),
+        "historical_checked": historical_stats["checked"],
+        "historical_updated": historical_stats["updated"],
+    }
 
 
 def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
@@ -1963,9 +2911,139 @@ def bump_live_ath_for_chat(chat_id, token_meta_map, reactivate=False):
             old_current = float(doc.get("current_mcap", initial) or initial)
             old_x = max(old_ath, old_current) / initial
             new_x = max(old_ath, float(mcap)) / initial
+            doc["current_mcap"] = mcap
+            doc["ath_mcap"] = max(old_ath, float(mcap))
+            doc["volume_h1"] = volume_h1
+            doc["volume_h24"] = volume_h24
+            set_fields = refresh_state_update_fields(doc, now=now)
+            if new_x > old_x + 1e-12:
+                set_fields["ath_seen_at"] = now
+                set_fields["last_ath_change_at"] = now
+                set_fields["ath_source"] = "dex_live"
+            calls_collection.update_one({"_id": doc["_id"]}, {"$set": set_fields})
             upsert_rollup_for_call_peak_delta(doc, old_x, new_x)
 
     return {"matched": total_matched, "modified": total_modified}
+
+
+def bump_archived_ath_for_chat(chat_id, token_meta_map):
+    if not token_meta_map:
+        return {"matched": 0, "modified": 0}
+
+    total_matched = 0
+    total_modified = 0
+    now = utc_now()
+    for ca_norm, token_meta in token_meta_map.items():
+        mcap = float(token_meta.get("fdv", 0) or 0)
+        if mcap <= 0:
+            continue
+
+        candidates = list(
+            calls_archive_collection.find(
+                _accepted_query(chat_id, {"ca_norm": ca_norm}),
+                {
+                    "_id": 1,
+                    "chat_id": 1,
+                    "caller_id": 1,
+                    "caller_name": 1,
+                    "initial_mcap": 1,
+                    "ath_mcap": 1,
+                    "current_mcap": 1,
+                },
+            )
+        )
+        if not candidates:
+            continue
+
+        update_doc = {
+            "$set": {
+                "current_mcap": mcap,
+                "last_market_refresh_at": now,
+            },
+            "$max": {"ath_mcap": mcap},
+        }
+        symbol = token_meta.get("symbol")
+        if symbol:
+            update_doc["$set"]["token_symbol"] = symbol
+
+        result = calls_archive_collection.update_many(
+            _accepted_query(chat_id, {"ca_norm": ca_norm}),
+            update_doc,
+        )
+        total_matched += int(result.matched_count or 0)
+        total_modified += int(result.modified_count or 0)
+
+        for doc in candidates:
+            initial = float(doc.get("initial_mcap", 0) or 0)
+            if initial <= 0:
+                continue
+            old_ath = float(doc.get("ath_mcap", initial) or initial)
+            old_current = float(doc.get("current_mcap", initial) or initial)
+            old_x = max(old_ath, old_current) / initial
+            new_x = max(old_ath, float(mcap)) / initial
+            if new_x > old_x + 1e-12:
+                calls_archive_collection.update_one(
+                    {"_id": doc["_id"]},
+                    {"$set": {"ath_seen_at": now, "last_ath_change_at": now, "ath_source": "dex_live"}},
+                )
+            upsert_rollup_for_call_peak_delta(doc, old_x, new_x)
+
+    return {"matched": total_matched, "modified": total_modified}
+
+
+def mark_reposted_calls(chat_id, ca_norm):
+    ca_norm = normalize_ca(ca_norm or "")
+    if not ca_norm:
+        return {"live": 0, "archive": 0}
+
+    now = utc_now()
+    live_calls = list(calls_collection.find(_accepted_query(chat_id, {"ca_norm": ca_norm})).limit(20))
+    archived_calls = list(calls_archive_collection.find(_accepted_query(chat_id, {"ca_norm": ca_norm})).limit(20))
+    live_updated = 0
+    archive_updated = 0
+
+    for call in live_calls:
+        call["last_reposted_at"] = now
+        call["repost_count"] = int(call.get("repost_count", 0) or 0) + 1
+        set_fields = {
+            "last_reposted_at": now,
+            "repost_count": call["repost_count"],
+            "is_stashed": False,
+            "last_reactivated_at": now,
+        }
+        set_fields.update(refresh_state_update_fields(call, now=now))
+        result = calls_collection.update_one(
+            {"_id": call["_id"]},
+            {"$set": set_fields, "$unset": {"stashed_reason": "", "stashed_at": ""}},
+        )
+        live_updated += int(result.modified_count or 0)
+
+    for call in archived_calls:
+        result = calls_archive_collection.update_one(
+            {"_id": call["_id"]},
+            {
+                "$set": {"last_reposted_at": now},
+                "$inc": {"repost_count": 1},
+            },
+        )
+        archive_updated += int(result.modified_count or 0)
+
+    return {"live": live_updated, "archive": archive_updated}
+
+
+def reconcile_existing_call_history_for_ca(chat_id, ca_norm, force=True):
+    if not HISTORICAL_ATH_ENABLED:
+        return {"checked": 0, "updated": 0}
+
+    ca_norm = normalize_ca(ca_norm or "")
+    if not ca_norm:
+        return {"checked": 0, "updated": 0}
+
+    live_calls = list(calls_collection.find(_accepted_query(chat_id, {"ca_norm": ca_norm})).sort("timestamp", 1).limit(20))
+    archived_calls = list(calls_archive_collection.find(_accepted_query(chat_id, {"ca_norm": ca_norm})).sort("timestamp", 1).limit(20))
+    entries = build_historical_reconcile_entries(live_calls, collection_name="live")
+    entries += build_historical_reconcile_entries(archived_calls, collection_name="archive")
+    return reconcile_calls_with_historical_ath(entries, limit=40, force=force)
 
 
 async def run_streak_scan_for_chat(bot, chat_id, manual=False):
@@ -2306,6 +3384,7 @@ async def heartbeat_loop(application: Application):
                     ensure_group_key(chat_id)
                     refresh_started = time.perf_counter()
                     refreshed_calls = refresh_recent_call_peaks(chat_id)
+                    maybe_run_daily_rollup_repair(chat_id)
                     refresh_elapsed_ms = (time.perf_counter() - refresh_started) * 1000.0
                     record_refresh_runtime(chat_id, refresh_elapsed_ms, refreshed_calls)
                     await run_streak_scan_for_chat(application.bot, chat_id, manual=False)
@@ -2440,6 +3519,7 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
     found_cas_list = sorted(found_cas)
     batch_data = get_dexscreener_batch_meta(found_cas_list)
     bump_live_ath_for_chat(chat_id, batch_data, reactivate=True)
+    bump_archived_ath_for_chat(chat_id, batch_data)
 
     is_edited = update.edited_message is not None
 
@@ -2460,6 +3540,9 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rejection_reason = "duplicate_ca"
 
         if rejection_reason:
+            if rejection_reason == "duplicate_ca":
+                mark_reposted_calls(chat_id, ca_norm)
+                reconcile_existing_call_history_for_ca(chat_id, ca_norm, force=True)
             calls_collection.insert_one(
                 {
                     "chat_id": chat_id,
@@ -2484,7 +3567,6 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbol = token_meta.get("symbol", "")
         volume_h1 = float(token_meta.get("volume_h1", token_meta.get("volume_h24", 0)) or 0)
         volume_h24 = float(token_meta.get("volume_h24", 0) or 0)
-        is_stashed = volume_h1 < LOW_VOLUME_STASH_THRESHOLD
 
         if mcap and mcap > 0:
             call_data = {
@@ -2497,16 +3579,23 @@ async def track_ca(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "caller_username": user.username,
                 "initial_mcap": mcap,
                 "ath_mcap": mcap,
+                "ath_seen_at": now,
+                "ath_source": "dex_live",
+                "last_ath_change_at": now,
                 "current_mcap": mcap,
                 "token_symbol": symbol,
                 "volume_h1": volume_h1,
                 "volume_h24": volume_h24,
-                "is_stashed": is_stashed,
+                "is_stashed": False,
+                "repost_count": 0,
                 "timestamp": now,
                 "message_id": message_obj.message_id,
                 "message_date": msg_time,
                 "ingest_delay_seconds": delay_seconds,
             }
+            is_stashed = should_stash_low_volume_call(call_data, volume_h1, now=now)
+            call_data["is_stashed"] = is_stashed
+            call_data.update(refresh_state_update_fields(call_data, now=now))
             if is_stashed:
                 call_data["stashed_reason"] = "low_volume"
                 call_data["stashed_at"] = now
@@ -2541,7 +3630,8 @@ def _resolve_time_filter(context: ContextTypes.DEFAULT_TYPE):
     return query, time_text
 
 
-def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=False):
+def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=False, protected_ids=None):
+    protected_ids = {obj_id for obj_id in (protected_ids or set()) if obj_id is not None}
     refresh_targets = []
     for call in calls:
         if not call.get("ca"):
@@ -2584,10 +3674,31 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
             "last_market_refresh_at": now,
         }
         unset_fields = {}
+        if ath > old_ath_val + 1e-12:
+            update_fields["ath_seen_at"] = now
+            update_fields["last_ath_change_at"] = now
+            update_fields["ath_source"] = "dex_live"
         if meta.get("symbol"):
             update_fields["token_symbol"] = meta["symbol"]
+
+        call["current_mcap"] = current_mcap
+        call["ath_mcap"] = ath
+        call["volume_h1"] = volume_h1
+        call["volume_h24"] = volume_h24
+        if ath > old_ath_val + 1e-12:
+            call["ath_seen_at"] = now
+            call["last_ath_change_at"] = now
+            call["ath_source"] = "dex_live"
+        refresh_state = compute_call_refresh_state(call, now=now)
         if apply_stash_policy:
-            if volume_h1 < LOW_VOLUME_STASH_THRESHOLD:
+            should_stash = should_stash_low_volume_call(
+                call,
+                volume_h1,
+                now=now,
+                protected_ids=protected_ids,
+                state=refresh_state,
+            )
+            if should_stash:
                 update_fields["is_stashed"] = True
                 update_fields["stashed_reason"] = "low_volume"
                 update_fields["stashed_at"] = now
@@ -2595,21 +3706,23 @@ def refresh_calls_market_data(calls, include_stashed=False, apply_stash_policy=F
                 update_fields["is_stashed"] = False
                 unset_fields["stashed_reason"] = ""
                 unset_fields["stashed_at"] = ""
-
-        update_doc = {"$set": update_fields}
+        update_doc = {
+            "$set": {
+                **update_fields,
+                "refresh_priority": int(refresh_state["priority"]),
+                "refresh_interval_seconds": int(refresh_state["interval_seconds"]),
+                "next_refresh_at": refresh_state["next_refresh_at"],
+            }
+        }
         if unset_fields:
             update_doc["$unset"] = unset_fields
         result = calls_collection.update_one({"_id": call["_id"]}, update_doc)
         updated += int(result.modified_count or 0)
         upsert_rollup_for_call_peak_delta(call, old_x_peak, new_x_peak)
-        call["current_mcap"] = current_mcap
-        call["ath_mcap"] = ath
-        call["volume_h1"] = volume_h1
-        call["volume_h24"] = volume_h24
         if meta.get("symbol"):
             call["token_symbol"] = meta["symbol"]
         if apply_stash_policy:
-            call["is_stashed"] = volume_h1 < LOW_VOLUME_STASH_THRESHOLD
+            call["is_stashed"] = bool(update_fields.get("is_stashed", False))
     return updated
 
 
@@ -2669,7 +3782,7 @@ def fetch_best_win_text(chat_id, time_filter):
         {"$sort": {"_x_peak": -1}},
         {"$limit": 1},
     ]
-    rows = list(calls_collection.aggregate(pipeline))
+    rows = list(calls_collection.aggregate(pipeline, allowDiskUse=True))
     if not rows:
         return "N/A"
     row = rows[0]
@@ -2681,8 +3794,22 @@ def fetch_best_win_text(chat_id, time_filter):
     return f"{format_return(best_x)} by {row.get('caller_name', 'Unknown')} ({token})"
 
 
+def best_win_text_from_snapshot(snapshot):
+    if not snapshot:
+        return "N/A"
+    best = snapshot.get("best") or {}
+    best_x = float(best.get("best_x", 0) or 0.0)
+    if best_x <= 0:
+        return "N/A"
+    token = token_label(best.get("token_symbol", ""), best.get("ca", ""))
+    return f"{format_return(best_x)} by {best.get('caller_name', 'Unknown')} ({token})"
+
+
 def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_per_page):
     time_filter = time_filter or {}
+    cached = get_leaderboard_page_cache(chat_id, time_filter, is_bottom, page, items_per_page)
+    if cached is not None:
+        return cached.get("rows", []), int(cached.get("total", 0) or 0)
     match_query = {**accepted_call_filter(chat_id), **(time_filter or {})}
     skip_rows = max(0, int(page)) * max(1, int(items_per_page))
     if not time_filter:
@@ -2691,6 +3818,7 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
         total = caller_rollups_collection.count_documents(query)
         if total > 0:
             sort_order = [
+                ("score", ASCENDING if is_bottom else DESCENDING),
                 ("avg_x", ASCENDING if is_bottom else DESCENDING),
                 ("best_x", ASCENDING if is_bottom else DESCENDING),
                 ("win_rate", ASCENDING if is_bottom else DESCENDING),
@@ -2708,6 +3836,7 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
                         "best_x": 1,
                         "win_rate": 1,
                         "profitable_rate": 1,
+                        "score": 1,
                     },
                 )
                 .sort(sort_order)
@@ -2723,10 +3852,28 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
                     "best_x": float(row.get("best_x", 0.0) or 0.0),
                     "win_rate": float(row.get("win_rate", 0.0) or 0.0),
                     "profitable_rate": float(row.get("profitable_rate", 0.0) or 0.0),
+                    "score": float(row.get("score", 0.0) or 0.0),
                 }
                 for row in rows
             ]
+            set_leaderboard_page_cache(
+                chat_id,
+                time_filter,
+                is_bottom,
+                page,
+                items_per_page,
+                {"rows": mapped, "total": int(total)},
+            )
             return mapped, int(total)
+        set_leaderboard_page_cache(
+            chat_id,
+            time_filter,
+            is_bottom,
+            page,
+            items_per_page,
+            {"rows": [], "total": 0},
+        )
+        return [], 0
 
     group_pipeline = [
         {"$match": match_query},
@@ -2798,13 +3945,7 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
         },
         {"$match": {"calls": {"$gte": MIN_CALLS_REQUIRED}}},
         {
-            "$project": {
-                "_id": 0,
-                "caller_id": 1,
-                "name": 1,
-                "calls": 1,
-                "avg_now_x": 1,
-                "best_x": 1,
+            "$addFields": {
                 "win_rate": {
                     "$multiply": [
                         {"$cond": [{"$gt": ["$calls", 0]}, {"$divide": ["$wins", "$calls"]}, 0]},
@@ -2817,21 +3958,49 @@ def fetch_ranked_leaderboard_page(chat_id, time_filter, is_bottom, page, items_p
                         100,
                     ]
                 },
+                "score": mongo_performance_score_expr(
+                    calls_expr="$calls",
+                    wins_expr="$wins",
+                    profitables_expr="$profit",
+                    avg_x_expr="$avg_now_x",
+                    best_x_expr="$best_x",
+                ),
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "caller_id": 1,
+                "name": 1,
+                "calls": 1,
+                "avg_now_x": 1,
+                "best_x": 1,
+                "win_rate": 1,
+                "profitable_rate": 1,
+                "score": 1,
             }
         },
     ]
 
     count_pipeline = group_pipeline + [{"$count": "total"}]
-    count_rows = list(calls_collection.aggregate(count_pipeline))
+    count_rows = list(calls_collection.aggregate(count_pipeline, allowDiskUse=True))
     total = int(count_rows[0]["total"]) if count_rows else 0
 
     sort_stage = (
-        {"$sort": {"avg_now_x": 1, "best_x": 1, "win_rate": 1, "calls": -1}}
+        {"$sort": {"score": 1, "avg_now_x": 1, "best_x": 1, "win_rate": 1, "calls": -1}}
         if is_bottom
-        else {"$sort": {"avg_now_x": -1, "best_x": -1, "win_rate": -1, "calls": -1}}
+        else {"$sort": {"score": -1, "avg_now_x": -1, "best_x": -1, "win_rate": -1, "calls": -1}}
     )
     page_pipeline = group_pipeline + [sort_stage, {"$skip": skip_rows}, {"$limit": max(1, int(items_per_page))}]
-    rows = list(calls_collection.aggregate(page_pipeline))
+    rows = list(calls_collection.aggregate(page_pipeline, allowDiskUse=True))
+    set_leaderboard_page_cache(
+        chat_id,
+        time_filter,
+        is_bottom,
+        page,
+        items_per_page,
+        {"rows": rows, "total": int(total)},
+    )
     return rows, total
 
 
@@ -2857,7 +4026,10 @@ async def _fetch_and_calculate_rankings(
         )
         return
 
-    best_win_text = fetch_best_win_text(chat_id, time_filter)
+    snapshot = None
+    if not is_bottom:
+        time_arg_key = str(context.args[0]).strip().lower() if context.args else "all"
+        snapshot = get_groupstats_cache(chat_id, time_arg_key)
 
     if is_bottom:
         title = f"Wall of Shame ({time_text})"
@@ -2867,7 +4039,9 @@ async def _fetch_and_calculate_rankings(
     else:
         title = f"Yabai Callers ({time_text})"
         highlight_label = "🔥 Best Win"
-        highlight_text = best_win_text
+        highlight_text = best_win_text_from_snapshot(snapshot)
+        if highlight_text == "N/A":
+            highlight_text = fetch_best_win_text(chat_id, time_filter)
 
     context.chat_data["leaderboard_chat_id"] = chat_id
     context.chat_data["leaderboard_time_filter"] = time_filter
@@ -2894,7 +4068,22 @@ async def _fetch_and_calculate_rankings(
             group_avatar_image=group_avatar_image,
         )
         context.chat_data["leaderboard_image_mode"] = True
-        caption_text, reply_markup = build_leaderboard_page(context, page=0)
+        caption_text = compose_leaderboard_page_text(
+            page_data=first_page_rows,
+            page=0,
+            items_per_page=6,
+            total_ranked=total_ranked,
+            title=title,
+            highlight_label=highlight_label,
+            highlight_text=highlight_text,
+            image_mode=True,
+        )
+        reply_markup = build_leaderboard_reply_markup(
+            page=0,
+            items_per_page=6,
+            total_ranked=total_ranked,
+            owner_id=context.chat_data["leaderboard_owner_id"],
+        )
         sent = await update.effective_message.reply_photo(
             photo=spotlight,
             caption=caption_text,
@@ -2924,6 +4113,54 @@ async def bottom(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _fetch_and_calculate_rankings(update, context, is_bottom=True, target_chat_id=chat_id)
 
 
+def compose_leaderboard_page_text(
+    page_data,
+    page,
+    items_per_page,
+    total_ranked,
+    title,
+    highlight_label,
+    highlight_text,
+    image_mode=False,
+):
+    total_pages = max(1, math.ceil(max(0, int(total_ranked or 0)) / max(1, int(items_per_page))))
+    start_idx = max(0, int(page or 0)) * max(1, int(items_per_page))
+    lines = [
+        f"🏆 {title.upper()}",
+        f"📄 Page {int(page or 0) + 1}/{total_pages}",
+        f"{highlight_label}: {highlight_text}",
+        "────────────────",
+    ]
+
+    for idx, row in enumerate(page_data, start=start_idx + 1):
+        badge = rank_badge(idx)
+        trend_emoji = "📉" if float(row.get("avg_now_x", 0) or 0) < 1 else "📈"
+        lines.append(
+            f"{badge} {row.get('name', 'Unknown')}\n"
+            f"↳ ⭐ Score: {float(row.get('score', 0) or 0):.1f} | {trend_emoji} Avg: {format_return(row.get('avg_now_x', 0))}\n"
+            f"↳ 🔥 Best: {format_return(row.get('best_x', 0))} | 🎯 Win: {float(row.get('win_rate', 0) or 0):.1f}% | 📞 Calls {int(row.get('calls', 0) or 0)}"
+        )
+        lines.append("────────────────")
+
+    text = "\n".join(lines).strip()
+    if image_mode and len(text) > 1020:
+        text = text[:1017] + "..."
+    return text
+
+
+def build_leaderboard_reply_markup(page, items_per_page, total_ranked, owner_id):
+    total_pages = max(1, math.ceil(max(0, int(total_ranked or 0)) / max(1, int(items_per_page))))
+    page = max(0, min(int(page or 0), total_pages - 1))
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton("Prev", callback_data=f"lb_{page-1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton("Next", callback_data=f"lb_{page+1}"))
+
+    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
+    return with_delete_button(reply_markup, owner_id)
+
+
 def build_leaderboard_page(context, page=0):
     chat_id = context.chat_data.get("leaderboard_chat_id")
     time_filter = context.chat_data.get("leaderboard_time_filter", {}) or {}
@@ -2948,39 +4185,22 @@ def build_leaderboard_page(context, page=0):
         page=page,
         items_per_page=items_per_page,
     )
-    start_idx = page * items_per_page
-
-    lines = [
-        f"🏆 {title.upper()}",
-        f"📄 Page {page + 1}/{total_pages}",
-        f"{highlight_label}: {highlight_text}",
-        "────────────────",
-    ]
-
-    for idx, row in enumerate(page_data, start=start_idx + 1):
-        badge = rank_badge(idx)
-        stars = stars_from_rank(idx)
-        star_block = f" {stars}" if stars else ""
-        trend_emoji = "📉" if row["avg_now_x"] < 1 else "📈"
-        lines.append(
-            f"{badge} {row['name']}{star_block}\n"
-            f"↳ {trend_emoji} Avg: {format_return(row['avg_now_x'])} | 🔥 Best: {format_return(row['best_x'])}\n"
-            f"↳ 🎯 Win: {row['win_rate']:.1f}% | 📞 Calls: {row['calls']}"
-        )
-        lines.append("────────────────")
-
-    text = "\n".join(lines).strip()
-    if image_mode and len(text) > 1020:
-        text = text[:1017] + "..."
-
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton("Prev", callback_data=f"lb_{page-1}"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton("Next", callback_data=f"lb_{page+1}"))
-
-    reply_markup = InlineKeyboardMarkup([buttons]) if buttons else None
-    reply_markup = with_delete_button(reply_markup, owner_id)
+    text = compose_leaderboard_page_text(
+        page_data=page_data,
+        page=page,
+        items_per_page=items_per_page,
+        total_ranked=total_ranked,
+        title=title,
+        highlight_label=highlight_label,
+        highlight_text=highlight_text,
+        image_mode=image_mode,
+    )
+    reply_markup = build_leaderboard_reply_markup(
+        page=page,
+        items_per_page=items_per_page,
+        total_ranked=total_ranked,
+        owner_id=owner_id,
+    )
     return text, reply_markup
 
 
@@ -3097,8 +4317,7 @@ async def caller_profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actual_name = recent_calls[0].get("caller_name", "Unknown")
     caller_id = recent_calls[0].get("caller_id")
     win_pct = metrics["win_rate"] * 100
-    caller_penalty = get_reputation_penalty(chat_id, caller_id) if caller_id is not None else 0.0
-    caller_score = max(0.0, metrics["reputation"] - caller_penalty)
+    caller_score = float(metrics["reputation"])
     avg_text = format_return(1 + metrics["avg_ath"])
     best_text = format_return(metrics["best_x"])
     stars = stars_from_score(caller_score)
@@ -3219,9 +4438,8 @@ async def my_score(update: Update, context: ContextTypes.DEFAULT_TYPE):
     metrics = derive_user_metrics(user_calls)
     rug = derive_rug_stats(user_calls)
 
-    penalty = get_reputation_penalty(chat_id, user.id)
     win_pct = metrics["win_rate"] * 100
-    score = max(0.0, metrics["reputation"] - penalty)
+    score = float(metrics["reputation"])
     stars = stars_from_score(score)
 
     text = (
@@ -3802,7 +5020,7 @@ def top_caller_id(chat_id: int, lookback_days: int = 7):
     best_score = -10**9
     for caller_id, call_set in user_calls.items():
         metrics = derive_user_metrics(call_set)
-        score = (1.0 + metrics["avg_ath"]) + (metrics["win_rate"] * 0.5)
+        score = float(metrics["reputation"])
         if metrics["calls"] >= 2 and score > best_score:
             best = caller_id
             best_score = score
@@ -3888,7 +5106,9 @@ async def admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "⚡ ATH REFRESH COMPLETE\n────────────────\n"
             f"Calls scanned: {stats['calls']}\n"
+            f"Live/Archive scanned: {stats.get('live_calls', 0)}/{stats.get('archived_calls', 0)}\n"
             f"Tokens scanned: {stats['tokens']}\n"
+            f"Historical checked/updated: {stats.get('historical_checked', 0)}/{stats.get('historical_updated', 0)}\n"
             f"Records updated: {stats['updated']}",
             reply_markup=delete_button_markup(user_id),
         )
